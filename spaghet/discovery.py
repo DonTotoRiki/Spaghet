@@ -1,6 +1,8 @@
 import ipaddress
+import re
 import socket
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from manuf import manuf
@@ -15,12 +17,16 @@ _oui = manuf.MacParser()
 
 # Au-delà, un scan ARP prend trop longtemps et inonde le réseau.
 MAX_HOSTS = 1024
+# Proxy ARP (VM, box, Wi-Fi d'entreprise) : une même MAC répond pour plus de la moitié des adresses du sous-réseau,
+# et au moins pour ce nombre. Un répéteur Wi-Fi qui traduit les MAC ne répond, lui, que pour ses vrais clients.
+PROXY_ARP_THRESHOLD = 8
 
 
 def local_network(iface: str | None = None, routes=None) -> tuple[str, ipaddress.IPv4Network, str, str | None]:
     """Renvoie (interface, sous-réseau, ip locale, passerelle) à partir de la table de routage de scapy."""
     routes = conf.route.routes if routes is None else routes
-    default = next((r for r in routes if r[1] == 0 and (iface is None or r[3] == iface)), None)
+    # Plusieurs routes par défaut (câble + Wi-Fi) : la plus petite métrique est celle qu'utilise le système.
+    default = min((r for r in routes if r[1] == 0 and (iface is None or r[3] == iface)), key=lambda r: r[5], default=None)
     if iface is None:
         if default is None:
             raise RuntimeError("Pas de route par défaut : précise l'interface avec --iface")
@@ -41,8 +47,15 @@ def local_network(iface: str | None = None, routes=None) -> tuple[str, ipaddress
     return iface, subnet, addr, gateway
 
 
-def scan(network: Network, iface: str | None = None, timeout: float = 2.0) -> None:
-    """Scan ARP du sous-réseau local. Nécessite root ou CAP_NET_RAW."""
+def proxy_arp_macs(replies: list[tuple[str, str]], num_addresses: int) -> set[str]:
+    """MAC qui répondent pour la majorité des adresses (ip, mac) : leurs réponses ne prouvent pas qu'un appareil existe."""
+    counts = Counter(mac for _ip, mac in replies)
+    limit = max(PROXY_ARP_THRESHOLD, num_addresses // 2)
+    return {mac for mac, n in counts.items() if n > limit}
+
+
+def scan(network: Network, iface: str | None = None, timeout: float = 2.0) -> set[str]:
+    """Scan ARP du sous-réseau local. Nécessite root ou CAP_NET_RAW. Renvoie les MAC de proxy ARP ignorées."""
     iface, subnet, my_ip, gateway = local_network(iface)
     if subnet.num_addresses > MAX_HOSTS:
         raise RuntimeError(f"{subnet} est trop grand ({subnet.num_addresses} adresses, max {MAX_HOSTS})")
@@ -52,8 +65,12 @@ def scan(network: Network, iface: str | None = None, timeout: float = 2.0) -> No
         network.upsert_node(gateway, kind="router")
 
     answered, _ = arping(str(subnet), iface=iface, timeout=timeout, verbose=False)
-    for _sent, reply in answered:
-        network.upsert_node(reply.psrc, mac=reply.hwsrc)
+    replies = [(reply.psrc, reply.hwsrc) for _sent, reply in answered]
+    proxies = proxy_arp_macs(replies, subnet.num_addresses)
+    for ip, mac in replies:
+        if mac not in proxies or ip == gateway:
+            network.upsert_node(ip, mac=mac)
+    return proxies
 
 
 def _reverse_dns(ip: str) -> str | None:
@@ -62,7 +79,12 @@ def _reverse_dns(ip: str) -> str | None:
     except OSError:
         return None
     # Nom synthétique de systemd-resolved pour la passerelle, n'apprend rien.
-    return None if name == "_gateway" else name
+    return None if name == "_gateway" else unescape_dns(name)
+
+
+def unescape_dns(name: str) -> str:
+    """Échappements DNS \\DDD (décimal) : « 04\\05800 » → « 04:00 »."""
+    return re.sub(r"\\(\d{3})", lambda m: chr(int(m[1])), name)
 
 
 def _mdns(timeout: float) -> dict[str, tuple[str, set[str]]]:
@@ -106,12 +128,9 @@ def _netbios(ips: list[str], timeout: float) -> dict[str, str]:
     return names
 
 
-def identify(network: Network, timeout: float = 3.0, only_new: bool = False) -> None:
-    """Fabricant, nom et type des nœuds déjà découverts. Le premier nom trouvé gagne : DNS inverse, mDNS, NetBIOS.
-
-    only_new : seulement les nœuds sans fabricant ni nom, pour les rescans périodiques.
-    """
-    nodes = [n for n in list(network.nodes.values()) if not only_new or (n.vendor is None and n.name is None)]
+def identify(network: Network, ips, timeout: float = 3.0) -> None:
+    """Fabricant, nom et type des appareils du LAN donnés. Le premier nom trouvé gagne : DNS inverse, mDNS, NetBIOS."""
+    nodes = [n for ip in ips if (n := network.nodes.get(ip)) and n.kind != "internet"]
     if not nodes:
         return
     names: dict[str, str] = {}

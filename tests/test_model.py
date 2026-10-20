@@ -40,27 +40,16 @@ def test_traffic_merges_both_directions():
     assert net.nodes["10.0.0.2"].bytes_total == 160
 
 
-def test_snapshot_is_cytoscape_format():
+def test_snapshot_is_a_copy():
     net = Network()
     net.upsert_node("10.0.0.1", kind="router")
     net.add_traffic("10.0.0.1", "10.0.0.2", "dns", 10)
 
     snap = net.snapshot()
-    ids = {n["data"]["id"] for n in snap["nodes"]}
-    assert ids == {"10.0.0.1", "10.0.0.2"}
-    edge = snap["links"][0]["data"]
-    assert (edge["source"], edge["target"]) == ("10.0.0.1", "10.0.0.2")
-
-
-def test_diff_since_returns_only_changes():
-    net = Network()
-    net.upsert_node("10.0.0.1", now=1.0)
-    net.upsert_node("10.0.0.2", now=2.0)
-    net.add_traffic("10.0.0.1", "10.0.0.3", "dns", 10, now=3.0)
-
-    diff = net.diff_since(2.5)
-    assert {n["data"]["id"] for n in diff["nodes"]} == {"10.0.0.1", "10.0.0.3"}
-    assert [l["data"]["id"] for l in diff["links"]] == ["10.0.0.1-10.0.0.3"]
+    assert {n["ip"] for n in snap["nodes"]} == {"10.0.0.1", "10.0.0.2"}
+    assert (snap["links"][0]["a"], snap["links"][0]["b"]) == ("10.0.0.1", "10.0.0.2")
+    snap["nodes"][0]["name"] = "modifié"  # une copie : l'interface la lit sans verrou
+    assert all(n.name != "modifié" for n in net.nodes.values())
 
 
 def test_info_update_does_not_mark_seen():
@@ -68,7 +57,7 @@ def test_info_update_does_not_mark_seen():
     net.upsert_node("10.0.0.1", now=1.0)
     net.upsert_node("10.0.0.1", now=50.0, seen=False, name="pc")
     node = net.nodes["10.0.0.1"]
-    assert (node.last_seen, node.updated) == (1.0, 50.0)
+    assert (node.last_seen, node.name) == (1.0, "pc")
 
 
 def test_prune_removes_silent_nodes_and_their_links():
@@ -77,8 +66,6 @@ def test_prune_removes_silent_nodes_and_their_links():
     net.add_traffic("10.0.0.1", "10.0.0.2", "dns", 10, now=100.0)
     net.upsert_node("10.0.0.1", now=1000.0)
 
-    removed = net.prune(300, now=1000.0)
-    assert set(removed) == {"10.0.0.2", "10.0.0.1-10.0.0.2"}
+    assert net.prune(300, now=1000.0) == ["10.0.0.2"]
     assert list(net.nodes) == ["10.0.0.1"]
     assert net.links == {}
-    assert set(net.diff_since(999.0)["removed"]) == set(removed)

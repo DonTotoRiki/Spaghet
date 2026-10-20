@@ -1,6 +1,6 @@
 import ipaddress
 
-from scapy.all import DNS, DNSQR, DNSRR, ICMP, IP, TCP, UDP, Ether, sniff, wrpcap
+from scapy.all import DNS, DNSQR, DNSRR, ICMP, IP, TCP, UDP, Ether, ICMPv6EchoRequest, IPv6, Raw, sniff, wrpcap
 
 from spaghet.capture import UNRESOLVED, make_handler, tls_sni
 from spaghet.classify import protocol, registrable_domain
@@ -90,3 +90,52 @@ def test_tick_computes_bitrate():
     link = net.links[link_key(PC, GW)]
     assert link.bps == 5000 * 8 / 2.0
     assert (link.a, link.bps_ab) == (GW, 1000 * 8 / 2.0)  # a = GW (« 192.168.1.1 » < « 192.168.1.10 »)
+
+
+PC_MAC, GW_MAC = "3c:22:fb:00:00:10", "6c:e3:1a:c2:3d:42"
+PREFIX6 = ipaddress.IPv6Network("2a02:a03f:6487:ae01::/64")
+PC6, PC6_TEMP, GW6 = "2a02:a03f:6487:ae01::10", "2a02:a03f:6487:ae01:1be6:105f:d7d1:1f44", "fe80::6e3:1aff:fec2:3d42"
+YT6 = "2a00:1450:4007:80c::200e"
+
+
+def ipv6_network() -> Network:
+    net = Network()
+    net.upsert_node(PC, mac=PC_MAC)
+    net.upsert_node(GW, mac=GW_MAC, kind="router")
+    return net
+
+
+def test_ipv6_replay(tmp_path):
+    """Trafic IPv6 réel : nommé par un AAAA, rattaché aux nœuds IPv4 par la MAC, multicast ignoré."""
+    to_router, to_pc = Ether(src=PC_MAC, dst=GW_MAC), Ether(src=GW_MAC, dst=PC_MAC)
+    packets = [
+        to_pc / IPv6(src=GW6, dst=PC6) / UDP(sport=53, dport=40000) / DNS(
+            qr=1, qd=[DNSQR(qname="rr1.googlevideo.com", qtype="AAAA")],
+            an=[DNSRR(rrname="rr1.googlevideo.com", type="AAAA", rdata=YT6)]),
+        to_pc / IPv6(src=YT6, dst=PC6_TEMP) / UDP(sport=443, dport=50001) / (b"x" * 1200),  # adresse temporaire du PC
+        to_router / IPv6(src=PC6, dst="2606:4700::1") / TCP(sport=50002, dport=443),          # jamais nommé
+        to_router / IPv6(src="fe80::1:2:3:4", dst=GW6) / ICMPv6EchoRequest(),               # lien local, par la MAC
+        Ether(src="aa:bb:cc:00:00:01", dst=GW_MAC) / IPv6(src="fe80::9", dst=GW6) / ICMPv6EchoRequest(),  # MAC inconnue
+        to_router / IPv6(src=PC6, dst="ff02::fb") / UDP(sport=5353, dport=5353),            # multicast ignoré
+    ]
+    pcap = tmp_path / "ipv6.pcap"
+    wrpcap(str(pcap), packets)
+
+    net = ipv6_network()
+    sniff(offline=str(pcap), prn=make_handler(net, SUBNET, prefixes6=[PREFIX6]), store=False)
+
+    assert set(net.links) == {link_key(PC, GW), link_key(PC, "googlevideo.com"), link_key(PC, UNRESOLVED)}
+    assert net.links[link_key(PC, "googlevideo.com")].protocols == {"streaming": len(packets[1])}
+    assert net.links[link_key(PC, GW)].protocols == {"dns": len(packets[0]), "infra": len(packets[3])}
+    assert net.nodes["googlevideo.com"].addr == YT6
+    assert not any(":" in node_id for node_id in net.nodes)  # aucun nœud par adresse IPv6
+
+
+def test_bad_packets_never_stop_the_capture():
+    """Un paquet DNS illisible faisait planter le callback, ce qui arrête la capture de scapy pour toujours."""
+    net = Network()
+    handle = make_handler(net, SUBNET)
+    garbage = Ether() / IP(src=GW, dst=PC) / UDP(sport=53, dport=40000) / Raw(b"\x12\x34\x81\x80\x00\x01\x00\x01" + b"\xff" * 8)
+    handle(Ether(bytes(garbage)))  # ne doit pas lever d'exception
+    handle(Ether() / IP(src=PC, dst=TV) / TCP(sport=50002, dport=8009))
+    assert link_key(PC, TV) in net.links  # la suite est toujours comptée

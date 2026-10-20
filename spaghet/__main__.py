@@ -1,12 +1,11 @@
 import argparse
+import os
 import sys
 import threading
 import time
 
-import uvicorn
-
-from spaghet import capture, discovery, geo, probes
-from spaghet.server import app, network
+from spaghet import capture, discovery, geo, gui, probes
+from spaghet.model import Network
 
 PROBE_INTERVAL = 10   # mesure de latence
 RESCAN_INTERVAL = 60  # scan ARP pour trouver les nouveaux appareils
@@ -26,39 +25,56 @@ def every(seconds: float, fn, *args) -> None:
     threading.Thread(target=loop, name=fn.__name__, daemon=True).start()
 
 
-def rescan(iface: str) -> None:
-    discovery.scan(network, iface)
-    discovery.identify(network, only_new=True)
-    network.prune(MAX_AGE)
-
-
 parser = argparse.ArgumentParser(prog="spaghet")
 parser.add_argument("--iface", help="interface réseau (par défaut : celle de la route par défaut)")
 parser.add_argument("--geoip", help=f"base GeoIP .mmdb (par défaut : $SPAGHET_GEOIP ou {geo.DEFAULT_PATH})")
 args = parser.parse_args()
 
-print("Scan ARP du réseau local…")
 try:
-    iface, subnet, _my_ip, _gateway = discovery.local_network(args.iface)
-    discovery.scan(network, iface)
-except PermissionError:
-    sys.exit("Le scan ARP demande les droits réseau : lance ./setcap.sh une fois (ou utilise sudo)")
+    iface, subnet, my_ip, _gateway = discovery.local_network(args.iface)
 except RuntimeError as e:
     sys.exit(str(e))
-print(f"{len(network.nodes)} appareils trouvés, identification…")
-discovery.identify(network)
-
-print("Mesure de la latence…")
-probes.ping_all(network, iface)
-every(PROBE_INTERVAL, probes.ping_all, network, iface)
-every(RESCAN_INTERVAL, rescan, iface)
-
 geo_reader = geo.load(args.geoip)
-print("Géolocalisation :", "activée" if geo_reader else f"désactivée (pas de base {args.geoip or geo.DEFAULT_PATH})")
+network = Network()
+identified: set[str] = set()  # chaque appareil n'est identifié qu'une fois, même s'il reste sans nom
 
-print("Capture du trafic…")
-capture.start(network, iface, subnet, geo_reader)
-every(1, network.tick)
 
-# 127.0.0.1 uniquement : l'outil expose des infos sur le réseau, il ne doit pas être joignable de l'extérieur.
-uvicorn.run(app, host="127.0.0.1", port=8000)
+def identify_new() -> None:
+    new = set(network.nodes) - identified
+    discovery.identify(network, new)
+    identified.update(new)
+
+
+def rescan() -> None:
+    discovery.scan(network, iface)
+    identify_new()
+    for ip in network.prune(MAX_AGE):
+        identified.discard(ip)  # s'il revient, il sera identifié à nouveau
+
+
+def backend(report) -> None:
+    """Découverte puis tâches de fond, lancées une fois la fenêtre ouverte. report(message) : barre d'état."""
+    try:
+        report("Scan ARP du réseau local…")
+        notes = []
+        if discovery.scan(network, iface):
+            notes.append("Proxy ARP détecté : seuls les appareils en contact avec cette machine apparaissent")
+        report(f"{len(network.nodes)} appareils trouvés, identification…")
+        identify_new()
+        report("Mesure de la latence…")
+        probes.ping_all(network, iface, my_ip)
+        every(PROBE_INTERVAL, probes.ping_all, network, iface, my_ip)
+        every(RESCAN_INTERVAL, rescan)
+        capture.start(network, iface, subnet, geo_reader)
+        every(1, network.tick)
+        if not geo_reader:
+            notes.append(f"Carte sans lieux : pas de base {args.geoip or geo.DEFAULT_PATH}")
+        report(" · ".join(notes))
+    except PermissionError:
+        report("Droits réseau manquants : ferme Spaghet, lance ./setcap.sh une fois, puis relance")
+    except Exception as e:
+        report(f"Erreur : {e}")
+
+
+# os._exit : ne pas attendre les threads de fond (recherches DNS en cours…) une fois la fenêtre fermée.
+os._exit(gui.run(network, backend))

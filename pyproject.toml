@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Cartographie visuelle du réseau local"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi",
-    "uvicorn",
+    "PySide6",
+    "numpy",
     "scapy",
     "zeroconf",
     "manuf",
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=61"]

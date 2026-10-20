@@ -1,20 +1,20 @@
 # Spaghet — Architecture technique
 
-Basé sur `Recherche.md`. Stack : Python ≥ 3.12, scapy, FastAPI, Cytoscape.js, Leaflet.
+Basé sur `Recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
 
-**État** : les 10 étapes sont codées et couvertes par 26 tests (`pytest`). Le frontend a été exécuté sans affichage (Cytoscape headless dans Node). **Rien n'a encore tourné sur un vrai réseau** : la capture, l'ARP et le traceroute demandent des droits réseau (voir « Lancement »).
+**État** : les 10 étapes sont codées, 29 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `Recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, la carte avec des lieux, et la fenêtre sur un vrai écran.
 
 ## Lancement
 
 ```
 cd ~/Bureau/Spaghet
 ./setcap.sh                    # une fois : droits réseau pour le Python du venv
-.venv/bin/python -m spaghet    # puis http://localhost:8000
+.venv/bin/python -m spaghet    # ouvre la fenêtre
 ```
 
 Options : `--iface` (défaut : interface de la route par défaut), `--geoip` (défaut : `$SPAGHET_GEOIP` ou `geoip.mmdb`).
 
-Au démarrage : scan ARP → identification → première mesure de latence → tâches de fond → serveur web.
+Au démarrage : la fenêtre s'ouvre tout de suite, puis un thread fait scan ARP → identification → première mesure de latence → tâches de fond. La barre d'état suit l'avancement et signale les problèmes (droits manquants, proxy ARP, pas de base GeoIP).
 
 | Tâche de fond | Fréquence |
 |---|---|
@@ -22,7 +22,8 @@ Au démarrage : scan ARP → identification → première mesure de latence → 
 | Scan ARP + identification des nouveaux + retrait des appareils muets depuis 5 min | 60 s |
 | Calcul du débit des liens (`Network.tick`) | 1 s |
 | Capture du trafic (`AsyncSniffer`) | continue |
-| Envoi des changements au navigateur | 1 s |
+| Relecture de l'état par l'interface (`Network.snapshot`) | 1 s |
+| Disposition du graphe et particules | ~30 images/s |
 
 ## Arborescence
 
@@ -38,22 +39,20 @@ Spaghet/
 │   ├── capture.py         # sniff → trafic sur les liens, noms via DNS et SNI TLS
 │   ├── probes.py          # latence par ARP, traceroute
 │   ├── geo.py             # géolocalisation .mmdb (optionnelle)
-│   └── server.py          # FastAPI : REST + WebSocket + fichiers statiques
-├── web/
-│   ├── index.html
-│   ├── app.js             # graphe, temps réel, particules, panneau, filtres, carte, exports
-│   └── style.css
+│   ├── gui.py             # fenêtre : barres d'outils, légendes, panneau de détails, exports, traceroute
+│   ├── graph_view.py      # graphe : disposition à forces (numpy), dessin, particules, zoom, clics
+│   └── map_view.py        # carte : tuiles OpenStreetMap, points des destinations
 └── tests/
-    ├── test_model.py      # nœuds, liens, diffs, retrait
-    ├── test_discovery.py  # détection du sous-réseau
+    ├── test_model.py      # nœuds, liens, copie, retrait
+    ├── test_discovery.py  # sous-réseau, proxy ARP, noms DNS échappés
     ├── test_classify.py   # type d'appareil
-    ├── test_probes.py     # lissage de la latence
+    ├── test_probes.py     # lissage de la latence, traceroute limité aux nœuds connus
     ├── test_capture.py    # ports, domaines, SNI, pcap rejoué, débit
     ├── test_geo.py        # lecture d'un enregistrement .mmdb
-    └── test_server.py     # page, WebSocket, API traceroute
+    └── test_gui.py        # particules, projection de la carte, fenêtre sans écran, export PNG
 ```
 
-Un seul processus, pas de base de données : l'état vit dans `Network`.
+Un seul processus, pas de serveur ni de base de données : l'état vit dans `Network`.
 
 ## Modèle de données (`model.py`)
 
@@ -63,7 +62,6 @@ class Node:
     ip: str              # identifiant : l'IP sur le LAN, le domaine pour une destination Internet
     first_seen: float
     last_seen: float     # dernière preuve de présence (réponse ARP, trafic)
-    updated: float       # dernière modification, sert aux diffs
     mac, name, vendor: str | None
     kind: str            # "router", "phone", "pc", "printer", "iot", "internet", "unknown"
     rtt_ms: float | None
@@ -79,7 +77,6 @@ class Link:
     a: str               # clé triée : a < b
     b: str
     last_seen: float
-    updated: float
     protocols: dict[str, int]   # catégorie → octets
     bytes_total: int
     bytes_ab: int        # part envoyée de a vers b (sens des particules)
@@ -91,37 +88,38 @@ class Network:
     add_traffic(src, dst, proto, octets)
     tick()                # débit, appelé chaque seconde
     prune(max_age)        # retire les nœuds muets et leurs liens
-    snapshot() / diff_since(t)
+    snapshot()            # copie en dicts, lue par l'interface et exportée en JSON
 ```
 
-Tous les modules écrivent dans `Network`, le serveur le lit. Un `threading.Lock` protège l'état.
+Les threads de fond écrivent dans `Network`, l'interface le lit. Un `threading.Lock` protège l'état.
 
-## Protocole GUI ↔ serveur
+## Interface ↔ moteur
 
-| Canal | Message | Contenu |
-|---|---|---|
-| `GET /api/snapshot` | état complet | `{now, nodes, links}` |
-| `WS /ws` à la connexion | état complet | `{type: "snapshot", now, nodes, links}` |
-| `WS /ws` toutes les 1 s, si changement | diff | `{type: "diff", now, nodes, links, removed}` |
-| `POST /api/traceroute/{id}` | traceroute | `{hops}` ; 404 nœud inconnu, 409 déjà en cours, 422 pas d'IP |
+Tout se passe dans le même processus :
 
-Format Cytoscape (`{data: {id, ...}}`) : le frontend n'a rien à convertir. `now` sert au navigateur à caler son horloge sur celle du serveur.
+| Sens | Moyen |
+|---|---|
+| Moteur → interface | un `QTimer` appelle `Network.snapshot()` chaque seconde ; le graphe, la carte, l'historique de débit et le panneau se mettent à jour à partir de cette copie |
+| Interface → moteur | traceroute : `probes.traceroute()` lancé dans un thread, résultat renvoyé par un signal Qt (`Bridge.traced`) |
+| Démarrage → barre d'état | `Bridge.status`, appelé par le thread de démarrage |
+
+Le graphe (`graph_view.py`) garde ses propres positions. Un nœud nouveau est posé près de la passerelle, ou près du cadre Internet ; la disposition à forces le place ensuite et se fige quand elle est stable.
 
 ## Étapes réalisées
 
 | # | Étape | Vérifié par |
 |---|---|---|
-| 0 | Squelette | page servie, test |
+| 0 | Squelette | tests |
 | 1 | Modèle | tests |
-| 2 | Découverte ARP + graphe en étoile | test du sous-réseau ; **scan réel non testé** |
-| 3 | Identification (fabricant, nom, type, icônes) | tests + DNS inverse/mDNS réels sans root ; NetBIOS non testé sur une vraie machine |
-| 4 | Latence | test du lissage ; **mesure réelle non testée** |
-| 5 | Temps réel | tests WebSocket et diffs ; page exécutée sans affichage |
-| 6 | Capture du trafic | pcap rejoué par scapy ; **capture réelle non testée** |
-| 7 | Destinations Internet | pcap rejoué (DNS, SNI, QUIC, non résolu) ; page exécutée sans affichage |
-| 8 | Particules, panneau, filtres | page exécutée sans affichage ; **rendu visuel non vérifié** |
-| 9 | Traceroute, géoloc, carte | API testée avec un traceroute simulé ; **carte non vue à l'écran** |
-| 10 | Exports, setcap, `--iface` | syntaxe ; **`setcap.sh` non exécuté** |
+| 2 | Découverte ARP + graphe en étoile | tests + **réseau réel** (proxy ARP détecté, 10 vrais appareils) |
+| 3 | Identification (fabricant, nom, type) | tests + **réseau réel** (noms DNS inverse, fabricants) ; NetBIOS sans résultat sur ce réseau |
+| 4 | Latence | test du lissage + **réseau réel** |
+| 5 | Temps réel | **réseau réel** : la fenêtre se met à jour chaque seconde |
+| 6 | Capture du trafic | pcap rejoué + **réseau réel** (trafic vers Internet visible) |
+| 7 | Destinations Internet | pcap rejoué (DNS, SNI, QUIC, non résolu) ; en réel, seulement « (non résolu) » pendant les 25 s de test |
+| 8 | Particules, panneau, filtres | captures de la fenêtre sans écran |
+| 9 | Traceroute, géoloc, carte | traceroute simulé ; carte avec tuiles réelles en capture ; **traceroute réel non testé** |
+| 10 | Exports, setcap, `--iface` | test d'export PNG ; `setcap.sh` exécuté par toi (le Python du venv a les droits) |
 
 ## Écarts avec le plan initial
 
@@ -133,10 +131,14 @@ Format Cytoscape (`{data: {id, ...}}`) : le frontend n'a rien à convertir. `now
 | `fixtures/sample.pcap` | pcap généré dans le test | Lisible, pas de fichier binaire |
 | Trafic Internet sur le lien PC ↔ passerelle (étape 6) | Nœud par domaine (étape 7) | Prévu par l'étape 7 |
 | Vidéo reconnue par le port | Liste de domaines de streaming (`STREAMING_DOMAINS`) | La vidéo passe par le port 443 comme le web |
-| Particules (plugin ou canvas) | Tirets ronds animés (`line-dash-offset`) | Fonction native de Cytoscape, rien à ajouter |
-| Historique de débit dans `Link` | Échantillonné dans le navigateur | Plus simple, n'alourdit pas les diffs ; vide à l'ouverture de la page |
-| Actions par WebSocket (`rescan`, `traceroute`) | Pas de `rescan` ; traceroute en `POST` | Le rescan est automatique ; un POST est plus simple |
+| Frontend web (FastAPI, WebSocket, Cytoscape.js, Leaflet) | Fenêtre Qt native (PySide6) | L'interface web ne fonctionnait pas ; une fenêtre native supprime serveur, WebSocket et dépendances chargées depuis Internet |
+| `diff_since` (envoi des seuls changements) | Copie complète chaque seconde | Sans réseau entre moteur et interface, la copie suffit et c'est plus simple |
+| Particules (plugin ou canvas) | Points dessinés par `QPainter` le long des liens | Dessin direct, sens et vitesse maîtrisés |
+| Icône emoji par type d'appareil | Couleur + légende « Appareils » | Qt n'affiche pas les emojis de façon fiable (police de secours) |
+| Historique de débit dans `Link` | Échantillonné par l'interface | N'alourdit pas le modèle ; vide au lancement |
+| Actions par WebSocket (`rescan`, `traceroute`) | Pas de `rescan` ; traceroute dans un thread | Le rescan est automatique |
 | `hops` dans une info-bulle | Dans le panneau de détails | Le panneau existait déjà |
+| Toute réponse ARP = un appareil | Proxy ARP détecté et ignoré | Sur le réseau de test, une même MAC répondait pour les 512 adresses |
 | `geoip2` + GeoLite2 | `maxminddb` + DB-IP City Lite ou GeoLite2 | Même format, moins de code ; DB-IP ne demande pas de compte |
 | Internet replié par défaut (`Recherche.md`) | Déplié par défaut | Les noms sont visibles tout de suite |
 | `setcap` sur l'interpréteur du venv | venv recréé avec `--copies`, puis `setcap.sh` | Le venv pointait vers `/usr/bin/python3.14` : `setcap` aurait donné les droits à tout Python du système |
@@ -156,16 +158,18 @@ Marqués `shortcut:` dans le code :
 - **DNS sécurisé (DoH)** : les réponses DNS deviennent invisibles ; QUIC (vidéo YouTube) chiffre aussi le SNI → destinations « (non résolu) ».
 - **ClientHello en deux segments** (Chrome) : SNI perdu, pas de réassemblage TCP.
 - **Performance de la capture** : scapy plafonne vers quelques milliers de paquets/s ; au-delà, le débit est sous-estimé. Piste : capture en Rust ou `pyshark`.
-- **Taille du graphe** : Cytoscape ralentit vers 300 nœuds ; le regroupement par domaine et le retrait à 5 min limitent la casse.
-- **Animation** : particules recalculées à chaque image, peut ramer au-delà d'environ 100 liens actifs.
-- **Layout** : relancé seulement quand un nœud arrive ou part ; les longueurs ne suivent pas chaque nouvelle mesure de latence.
-- **Carte** : les tuiles viennent d'OpenStreetMap, qui voit donc ton IP.
+- **Taille du graphe** : la disposition calcule toutes les paires de nœuds (n²) ; au-delà de quelques centaines de nœuds elle ralentit. Le regroupement par domaine et le retrait à 5 min limitent la casse.
+- **Animation** : 30 images/s, toutes les particules redessinées ; peut ramer au-delà d'environ 100 liens actifs.
+- **Disposition** : relancée seulement quand un nœud ou un lien arrive ou part ; les longueurs ne suivent pas chaque nouvelle mesure de latence.
+- **Proxy ARP** : sur un tel réseau, un appareil silencieux qui n'a pas sa propre réponse ARP reste invisible.
+- **Premier lancement** : la première identification a été lente (plus de 45 s) lors d'un essai, 9 s ensuite ; cause non confirmée (caches DNS et mDNS froids ?).
+- **Carte** : les tuiles viennent d'OpenStreetMap, qui voit donc ton IP. Elles ne sont téléchargées qu'à l'ouverture de l'onglet Carte.
 - **Table IP → nom** : grandit sans limite pendant la session.
 
 ## Sécurité
 
-- Le serveur écoute sur `127.0.0.1` uniquement.
-- Le traceroute ne vise qu'un nœud déjà présent dans le graphe, un seul à la fois.
-- Les noms venant du réseau (mDNS, DNS, SNI) sont échappés avant tout `innerHTML` et dans les infobulles Leaflet.
+- Pas de serveur : rien n'écoute sur le réseau.
+- Le traceroute ne vise qu'un nœud déjà présent dans le graphe, un seul à la fois (verrou dans `probes.py`).
+- Les noms venant du réseau (mDNS, DNS, SNI) sont affichés en texte brut (`Qt.PlainText`) et échappés dans les infobulles de la carte, que Qt interpréterait comme du HTML.
 - Scan ARP refusé au-delà de 1024 adresses.
 - `setcap.sh` refuse un Python partagé et restreint l'interpréteur privilégié à ton compte (`chmod 700`).

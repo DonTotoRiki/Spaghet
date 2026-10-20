@@ -8,8 +8,7 @@ from dataclasses import asdict, dataclass, field
 class Node:
     ip: str  # identifiant : l'IP sur le LAN, le domaine pour une destination Internet
     first_seen: float
-    last_seen: float   # dernière fois que l'appareil a répondu ou émis
-    updated: float     # dernière modification, sert aux diffs
+    last_seen: float  # dernière fois que l'appareil a répondu ou émis
     mac: str | None = None
     name: str | None = None
     vendor: str | None = None
@@ -30,7 +29,6 @@ class Link:
     a: str
     b: str
     last_seen: float
-    updated: float
     protocols: dict[str, int] = field(default_factory=dict)  # protocole → octets
     bytes_total: int = 0
     bytes_ab: int = 0  # part de bytes_total envoyée de a vers b, pour le sens des particules
@@ -46,34 +44,24 @@ def link_key(x: str, y: str) -> tuple[str, str]:
     return (x, y) if x < y else (y, x)
 
 
-def _node_json(n: Node) -> dict:
-    return {"data": {"id": n.ip, **asdict(n)}}
-
-
-def _link_json(l: Link) -> dict:
-    return {"data": {"id": f"{l.a}-{l.b}", "source": l.a, "target": l.b, **asdict(l)}}
-
-
 class Network:
-    """État du réseau en mémoire, partagé entre les threads de découverte, capture et serveur."""
+    """État du réseau en mémoire, partagé entre les threads de découverte, de capture et l'interface."""
 
     def __init__(self):
         self.nodes: dict[str, Node] = {}
         self.links: dict[tuple[str, str], Link] = {}
-        self._removed: list[tuple[float, str]] = []  # (date, id) des éléments supprimés, pour les diffs
         self._samples: dict[tuple[str, str], deque] = {}  # lien → (date, bytes_total) des derniers ticks
         self._lock = threading.Lock()
 
     def _touch(self, ip: str, now: float, seen: bool = True) -> Node:
         node = self.nodes.get(ip)
         if node is None:
-            node = self.nodes[ip] = Node(ip=ip, first_seen=now, last_seen=now, updated=now)
+            node = self.nodes[ip] = Node(ip=ip, first_seen=now, last_seen=now)
         if seen:
             node.last_seen = now
-        node.updated = now
         return node
 
-    def upsert_node(self, ip: str, now: float | None = None, seen: bool = True, **fields) -> Node:
+    def upsert_node(self, ip: str, now: float | None = None, seen: bool = True, **fields) -> None:
         """Crée ou met à jour un nœud. Les champs à None n'écrasent pas une valeur connue.
 
         seen=False : mise à jour d'infos (nom, fabricant…) qui ne prouve pas que l'appareil est encore là.
@@ -86,9 +74,8 @@ class Network:
                     raise AttributeError(f"Node n'a pas de champ {name!r}")
                 if value is not None:
                     setattr(node, name, value)
-            return node
 
-    def add_traffic(self, src: str, dst: str, proto: str, size: int, now: float | None = None) -> Link:
+    def add_traffic(self, src: str, dst: str, proto: str, size: int, now: float | None = None) -> None:
         with self._lock:
             now = time.time() if now is None else now
             for ip in (src, dst):
@@ -96,31 +83,25 @@ class Network:
             key = link_key(src, dst)
             link = self.links.get(key)
             if link is None:
-                link = self.links[key] = Link(a=key[0], b=key[1], last_seen=now, updated=now)
-            link.last_seen = link.updated = now
+                link = self.links[key] = Link(a=key[0], b=key[1], last_seen=now)
+            link.last_seen = now
             link.bytes_total += size
             if src == link.a:
                 link.bytes_ab += size
             link.protocols[proto] = link.protocols.get(proto, 0) + size
-            return link
 
     def prune(self, max_age: float, now: float | None = None) -> list[str]:
-        """Supprime les nœuds muets depuis plus de max_age secondes, et leurs liens."""
+        """Supprime les nœuds muets depuis plus de max_age secondes, et leurs liens. Renvoie les nœuds retirés."""
         with self._lock:
             now = time.time() if now is None else now
             gone = [ip for ip, n in self.nodes.items() if now - n.last_seen > max_age]
-            removed = []
             for ip in gone:
                 del self.nodes[ip]
-                removed.append(ip)
             for key, l in list(self.links.items()):
                 if l.a in gone or l.b in gone:
                     del self.links[key]
                     self._samples.pop(key, None)
-                    removed.append(f"{l.a}-{l.b}")
-            self._removed = [(t, i) for t, i in self._removed if now - t < 600]
-            self._removed += [(now, i) for i in removed]
-            return removed
+            return gone
 
     def tick(self, now: float | None = None) -> None:
         """À appeler chaque seconde : recalcule le débit de chaque lien sur les RATE_WINDOW dernières secondes."""
@@ -131,26 +112,13 @@ class Network:
                 samples.append((now, link.bytes_total, link.bytes_ab))
                 (t0, b0, ab0), (t1, b1, ab1) = samples[0], samples[-1]
                 rate = lambda before, after: round((after - before) * 8 / (t1 - t0)) if t1 > t0 else 0.0
-                bps, bps_ab = rate(b0, b1), rate(ab0, ab1)
-                if (bps, bps_ab) != (link.bps, link.bps_ab):
-                    link.bps, link.bps_ab = bps, bps_ab
-                    link.updated = now
+                link.bps, link.bps_ab = rate(b0, b1), rate(ab0, ab1)
 
     def snapshot(self) -> dict:
-        """État complet au format Cytoscape : {data: {id, ...}}."""
+        """Copie de l'état complet, lisible sans verrou par l'interface et exportable en JSON."""
         with self._lock:
             return {
                 "now": time.time(),
-                "nodes": [_node_json(n) for n in self.nodes.values()],
-                "links": [_link_json(l) for l in self.links.values()],
-            }
-
-    def diff_since(self, t: float) -> dict:
-        """Ce qui a changé depuis t. Renvoyer `now` au prochain appel pour ne rien rater."""
-        with self._lock:
-            return {
-                "now": time.time(),
-                "nodes": [_node_json(n) for n in self.nodes.values() if n.updated > t],
-                "links": [_link_json(l) for l in self.links.values() if l.updated > t],
-                "removed": [i for d, i in self._removed if d > t],
+                "nodes": [asdict(n) for n in self.nodes.values()],
+                "links": [asdict(l) for l in self.links.values()],
             }
