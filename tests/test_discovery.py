@@ -106,3 +106,40 @@ def test_big_subnet_scans_only_the_neighbourhood(monkeypatch):
     ])
     discovery.scan(Network())
     assert scanned == ["10.0.42.0/24"]
+
+
+def test_identify_survives_mdns_and_netbios_failures(monkeypatch):
+    from spaghet import discovery
+    from spaghet.model import Network
+
+    def fail(*_args):
+        raise OSError("No such device")
+
+    monkeypatch.setattr(discovery, "_reverse_dns", lambda ip: None)
+    monkeypatch.setattr(discovery, "_mdns", fail)
+    monkeypatch.setattr(discovery, "_netbios", fail)
+    net = Network()
+    net.upsert_node("192.168.1.10", mac="00:1b:21:aa:bb:cc")  # OUI Intel
+    discovery.identify(net, ["192.168.1.10"])
+    assert net.nodes["192.168.1.10"].vendor  # le fabricant, calculé localement, n'est pas perdu
+
+
+def test_scan_keeps_the_real_mac_answered_after_the_proxy(monkeypatch):
+    from types import SimpleNamespace
+
+    from spaghet import discovery
+    from spaghet.model import Network
+
+    # Le proxy répond pour toutes les adresses, y compris celles des appareils présents, et souvent avant eux.
+    proxy = "9a:55:9a:55:9a:55"
+    replies = [(None, SimpleNamespace(psrc=str(ip), hwsrc=proxy)) for ip in ipaddress.IPv4Network("192.168.128.0/23")]
+    replies += [(None, SimpleNamespace(psrc="192.168.128.10", hwsrc="3c:22:fb:00:00:01")),
+                (None, SimpleNamespace(psrc="192.168.128.1", hwsrc="04:e3:1a:c2:3d:42"))]  # vraie MAC de la passerelle
+    monkeypatch.setattr(discovery, "arping", lambda *a, **k: (replies if k.get("multi") else replies[:512], []))
+    monkeypatch.setattr(discovery, "get_if_hwaddr", lambda iface: "3c:22:fb:ff:ff:ff")
+    monkeypatch.setattr(discovery.conf.route, "routes", ROUTES)
+
+    net = Network()
+    assert discovery.scan(net) == {proxy}
+    assert net.nodes["192.168.128.10"].mac == "3c:22:fb:00:00:01"
+    assert net.nodes["192.168.128.1"].mac == "04:e3:1a:c2:3d:42"

@@ -1,10 +1,9 @@
 # Spaghet
 
-Cartographie visuelle du réseau local : Spaghet découvre les appareils du réseau, observe qui parle à qui (protocole, volume) et affiche le tout dans une fenêtre Qt, sous forme de graphe animé et de carte.
+Cartographie visuelle du réseau local : Spaghet découvre les appareils du réseau, observe qui parle à qui (protocole, volume) et affiche le tout dans une fenêtre Qt, sous forme de graphe animé.
 
 - **Graphe** : longueur des liens = latence, épaisseur et particules = débit, couleur du lien = protocole, couleur du nœud = type d’appareil.
-- **Carte** : destinations Internet placées par GeoIP (base `.mmdb` optionnelle).
-- **Détails** : fabricant, noms (DNS, mDNS, NetBIOS), sauts (traceroute), exports PNG.
+- **Détails** : fabricant, noms (DNS, mDNS, NetBIOS), sauts (traceroute), lieu des destinations Internet (GeoIP, base `.mmdb` optionnelle), exports PNG et JSON.
 
 ## Installation
 
@@ -22,7 +21,7 @@ python3 -m venv --copies .venv
 ./spaghet.sh [--iface IFACE] [--geoip FICHIER.mmdb]
 ```
 
-Sans `--geoip`, Spaghet lit `$SPAGHET_GEOIP` ou `geoip.mmdb`.
+Sans `--geoip`, Spaghet lit `$SPAGHET_GEOIP`, sinon `geoip.mmdb` dans le dossier du projet.
 
 ## Tests
 

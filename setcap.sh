@@ -12,9 +12,13 @@ case "$py" in
   *) echo "Refusé : $py n'est pas propre au projet. Recrée le venv avec : python3 -m venv --copies .venv" >&2; exit 1 ;;
 esac
 
-cp "$py" .venv/bin/python-net
-chmod 700 .venv/bin/python-net  # seul ton compte peut lancer cet interpréteur privilégié
-sudo setcap cap_net_raw,cap_net_admin+eip .venv/bin/python-net
+# Préparée à côté puis renommée : écrire sur python-net échoue (« Text file busy ») si Spaghet tourne, un renommage non.
+tmp=.venv/bin/python-net.tmp
+rm -f "$tmp"
+cp "$py" "$tmp"
+chmod 700 "$tmp"  # seul ton compte peut lancer cet interpréteur privilégié
+sudo setcap cap_net_raw,cap_net_admin+eip "$tmp"
+mv -f "$tmp" .venv/bin/python-net  # un Spaghet déjà ouvert garde l'ancien interpréteur jusqu'à sa fermeture
 # Anciennes versions de ce script : les droits étaient sur le Python habituel, on les retire.
 if [ -n "$(getcap "$py")" ]; then
   sudo setcap -r "$py"

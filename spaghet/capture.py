@@ -91,6 +91,12 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
             return None  # diffusion : personne en particulier à l'autre bout
         if addr.version == 4 and addr in subnet:
             return ip
+        if addr.version == 4 and not addr.is_global:
+            # Réseau privé hors du sous-réseau (autre box, VPN, CGNAT 100.64/10, 169.254) : ni le LAN scanné, ni
+            # Internet. Un nœud par adresse, nommé tout de suite pour que l'identification ne l'interroge pas en NetBIOS.
+            if ip not in network.nodes:
+                network.upsert_node(ip, name=f"{ip} (réseau privé)")
+            return ip
         if addr.version == 6 and (addr.is_link_local or addr.is_private or any(addr in p for p in prefixes6)):
             # Les appareils du LAN ont plusieurs adresses IPv6 (lien local, temporaires) : on les retrouve par la MAC.
             # Inconnue (appareil jamais vu en IPv4) : paquet ignoré plutôt qu'un nœud de plus par adresse.

@@ -2,7 +2,7 @@
 
 Basé sur `recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
 
-**État** : les 10 étapes sont codées, 54 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, la carte avec des lieux, et la fenêtre sur un vrai écran.
+**État** : les 10 étapes sont codées, 63 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, les lieux GeoIP, et la fenêtre sur un vrai écran. L'onglet Carte (tuiles OpenStreetMap) a été retiré : il n'apportait rien.
 
 ## Lancement
 
@@ -12,7 +12,7 @@ cd ~/Bureau/Spaghet
 ./spaghet.sh    # ouvre la fenêtre
 ```
 
-Options : `--iface` (défaut : interface de la route par défaut), `--geoip` (défaut : `$SPAGHET_GEOIP` ou `geoip.mmdb`).
+Options : `--iface` (défaut : interface de la route par défaut), `--geoip` (défaut : `$SPAGHET_GEOIP`, sinon `geoip.mmdb` dans le dossier du projet, posé par `spaghet.sh`).
 
 Au démarrage : la fenêtre s'ouvre tout de suite, puis un thread fait scan ARP → identification → première mesure de latence → tâches de fond. La barre d'état suit l'avancement et signale les problèmes (droits manquants, proxy ARP, pas de base GeoIP).
 
@@ -37,7 +37,7 @@ Spaghet/
 ├── setcap.sh              # droits réseau sur .venv/bin/python-net (refuse un Python partagé)
 ├── spaghet.sh             # lanceur : python-net -m spaghet
 ├── spaghet/
-│   ├── __main__.py        # point d'entrée, options, tâches de fond (every)
+│   ├── __main__.py        # main() : options ; Backend : tâches de fond (every), surveillance réseau et capture
 │   ├── model.py           # Node, Link, Network : état en mémoire, diffs, débit, retrait
 │   ├── discovery.py       # sous-réseau, scan ARP, fabricant, DNS inverse, mDNS, NetBIOS
 │   ├── classify.py        # type d'appareil, catégorie de trafic, domaine regroupé, domaines streaming
@@ -45,8 +45,7 @@ Spaghet/
 │   ├── probes.py          # latence par ARP, traceroute
 │   ├── geo.py             # géolocalisation .mmdb (optionnelle)
 │   ├── gui.py             # fenêtre : barres d'outils, légendes, panneau de détails, exports, traceroute
-│   ├── graph_view.py      # graphe : disposition à forces (numpy), dessin, particules, zoom, clics
-│   └── map_view.py        # carte : tuiles OpenStreetMap, points des destinations
+│   └── graph_view.py      # graphe : disposition à forces (numpy), dessin, particules, zoom, clics
 └── tests/
     ├── test_model.py      # nœuds, liens, copie, retrait
     ├── test_discovery.py  # sous-réseau, proxy ARP, noms DNS échappés
@@ -54,7 +53,8 @@ Spaghet/
     ├── test_probes.py     # lissage de la latence, traceroute limité aux nœuds connus
     ├── test_capture.py    # ports, domaines, SNI, pcap rejoué, débit
     ├── test_geo.py        # lecture d'un enregistrement .mmdb
-    └── test_gui.py        # particules, projection de la carte, fenêtre sans écran, export PNG
+    ├── test_gui.py        # particules, fenêtre sans écran, export PNG, zoom, latence
+    └── test_main.py       # tâches de fond : retrait, premier scan raté, coupure de capture, changement de réseau
 ```
 
 Un seul processus, pas de serveur ni de base de données : l'état vit dans `Network`.
@@ -104,7 +104,7 @@ Tout se passe dans le même processus :
 
 | Sens | Moyen |
 |---|---|
-| Moteur → interface | un `QTimer` appelle `Network.snapshot()` chaque seconde ; le graphe, la carte, l'historique de débit et le panneau se mettent à jour à partir de cette copie |
+| Moteur → interface | un `QTimer` appelle `Network.snapshot()` chaque seconde ; le graphe, l'historique de débit et le panneau se mettent à jour à partir de cette copie |
 | Interface → moteur | traceroute : `probes.traceroute()` lancé dans un thread, résultat renvoyé par un signal Qt (`Bridge.traced`) |
 | Démarrage → barre d'état | `Bridge.status`, appelé par le thread de démarrage |
 
@@ -155,7 +155,7 @@ Marqués `shortcut:` dans le code :
 - **Type d'appareil** (`classify.py`) : mots-clés de fabricant, se trompent sur les marques multi-produits (Samsung, HP, TP-Link).
 - **Catégorie de trafic** (`classify.py`) : par port ; seuls les domaines de `STREAMING_DOMAINS` sortent du « web ».
 - **Domaine regroupé** (`classify.py`) : approximation de la Public Suffix List ; `tldextract` si les regroupements sont faux.
-- **IP d'une destination** (`capture.py`) : première IP vue seulement ; un CDN est souvent mal placé sur la carte.
+- **IP d'une destination** (`capture.py`) : première IP vue seulement ; le lieu affiché pour un CDN est souvent faux.
 
 ## Limites à connaître
 
@@ -165,16 +165,15 @@ Marqués `shortcut:` dans le code :
 - **Performance de la capture** : scapy plafonne vers quelques milliers de paquets/s ; au-delà, le débit est sous-estimé. Piste : capture en Rust ou `pyshark`.
 - **Taille du graphe** : la disposition calcule toutes les paires de nœuds (n²) ; au-delà de quelques centaines de nœuds elle ralentit. Le regroupement par domaine et le retrait à 5 min limitent la casse.
 - **Animation** : 30 images/s, toutes les particules redessinées ; peut ramer au-delà d'environ 100 liens actifs.
-- **Disposition** : relancée seulement quand un nœud ou un lien arrive ou part ; les longueurs ne suivent pas chaque nouvelle mesure de latence.
+- **Disposition** : relancée quand un nœud ou un lien arrive ou part, ou quand une latence change assez pour que la longueur idéale bouge de plus de 15 unités (`RELAYOUT_LENGTH`) ; les petites variations ne la relancent pas.
 - **Proxy ARP** : sur un tel réseau, un appareil silencieux qui n'a pas sa propre réponse ARP reste invisible.
 - **Premier lancement** : la première identification a été lente (plus de 45 s) lors d'un essai, 9 s ensuite ; cause non confirmée (caches DNS et mDNS froids ?).
-- **Carte** : les tuiles viennent d'OpenStreetMap, qui voit donc ton IP. Elles ne sont téléchargées qu'à l'ouverture de l'onglet Carte.
 - **Table IP → nom** : grandit sans limite pendant la session.
 
 ## Sécurité
 
 - Pas de serveur : rien n'écoute sur le réseau.
 - Le traceroute ne vise qu'un nœud déjà présent dans le graphe, un seul à la fois (verrou dans `probes.py`).
-- Les noms venant du réseau (mDNS, DNS, SNI) sont affichés en texte brut (`Qt.PlainText`) et échappés dans les infobulles de la carte, que Qt interpréterait comme du HTML.
+- Les noms venant du réseau (mDNS, DNS, SNI) sont affichés en texte brut (`Qt.PlainText`).
 - Scan ARP refusé au-delà de 1024 adresses.
 - `setcap.sh` refuse un Python partagé, ne donne les droits qu'à `python-net` (jamais au Python de `pip`), et le restreint à ton compte (`chmod 700`).

@@ -71,12 +71,16 @@ def scan(network: Network, iface: str | None = None, timeout: float = 2.0) -> se
     if gateway:
         network.upsert_node(gateway, kind="router")
 
-    answered, _ = arping(str(subnet), iface=iface, timeout=timeout, verbose=False)
-    replies = [(reply.psrc, reply.hwsrc) for _sent, reply in answered]
+    # multi : un proxy ARP répond aussi pour les appareils présents, parfois avant eux ; on garde toutes les réponses.
+    answered, _ = arping(str(subnet), iface=iface, timeout=timeout, verbose=False, multi=True)
+    replies = {(reply.psrc, reply.hwsrc) for _sent, reply in answered}  # set : une réponse répétée ne compte qu'une fois
     proxies = proxy_arp_macs(replies, subnet.num_addresses)
-    for ip, mac in replies:
-        if mac not in proxies or ip == gateway:
-            network.upsert_node(ip, mac=mac)
+    macs: dict[str, str] = {}
+    for ip, mac in sorted(replies, key=lambda r: r[1] in proxies):  # vraies MAC d'abord
+        if mac not in proxies or ip == gateway:  # la passerelle garde la MAC du proxy si elle n'a pas la sienne
+            macs.setdefault(ip, mac)
+    for ip, mac in macs.items():
+        network.upsert_node(ip, mac=mac)
     return proxies
 
 
@@ -135,6 +139,15 @@ def _netbios(ips: list[str], timeout: float) -> dict[str, str]:
     return names
 
 
+def _optional(fn, *args) -> dict:
+    """mDNS et NetBIOS ne sont qu'un bonus : leur échec (interface sans multicast, VPN…) ne doit pas bloquer le reste."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        print(f"identification : {fn.__name__} ignoré ({type(e).__name__} : {e})", flush=True)
+        return {}
+
+
 def identify(network: Network, ips, timeout: float = 3.0) -> None:
     """Fabricant, nom et type des appareils du LAN donnés. Le premier nom trouvé gagne : DNS inverse, mDNS, NetBIOS."""
     nodes = [n for ip in ips if (n := network.nodes.get(ip)) and n.kind != "internet"]
@@ -147,14 +160,14 @@ def identify(network: Network, ips, timeout: float = 3.0) -> None:
             if name:
                 names[node.ip] = name
 
-    mdns = _mdns(timeout)
+    mdns = _optional(_mdns, timeout)
     for ip, (host, _services) in mdns.items():
         if host:
             names.setdefault(ip, host)
 
     missing = [n.ip for n in nodes if n.ip not in names and n.name is None]
     if missing:
-        for ip, name in _netbios(missing, timeout).items():
+        for ip, name in _optional(_netbios, missing, timeout).items():
             names.setdefault(ip, name)
 
     for node in nodes:

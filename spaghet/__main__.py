@@ -10,6 +10,7 @@ from spaghet.model import Network
 PROBE_INTERVAL = 10   # mesure de latence
 RESCAN_INTERVAL = 60  # scan ARP pour trouver les nouveaux appareils
 MAX_AGE = 300         # un appareil muet depuis 5 min est retiré
+NO_RIGHTS = "Droits réseau manquants : ferme Spaghet, lance ./setcap.sh une fois, puis relance avec ./spaghet.sh"
 
 
 def every(seconds: float, fn, *args) -> None:
@@ -25,91 +26,108 @@ def every(seconds: float, fn, *args) -> None:
     threading.Thread(target=loop, name=fn.__name__, daemon=True).start()
 
 
-parser = argparse.ArgumentParser(prog="spaghet")
-parser.add_argument("--iface", help="interface réseau (par défaut : celle de la route par défaut)")
-parser.add_argument("--geoip", help=f"base GeoIP .mmdb (par défaut : $SPAGHET_GEOIP ou {geo.DEFAULT_PATH})")
-args = parser.parse_args()
+class Backend:
+    """Tâches de fond : capture, scan, identification, latence, surveillance du réseau et de la capture."""
 
-try:
-    iface, subnet, my_ip, gateway = discovery.local_network(args.iface)
-except RuntimeError as e:
-    sys.exit(str(e))
-notes: list[str] = []  # remarques durables affichées dans la barre d'état
-try:
-    geo_reader = geo.load(args.geoip)
-    if not geo_reader:
-        notes.append(f"Carte sans lieux : pas de base {args.geoip or geo.DEFAULT_PATH}")
-except ValueError as e:
-    geo_reader = None
-    notes.append(f"Carte sans lieux : {e}")
-started_on = (iface, subnet, my_ip, gateway), set(capture.local_prefixes6(iface))  # set : l'ordre des adresses peut varier
-network = Network()
-identified: set[str] = set()  # chaque appareil n'est identifié qu'une fois, même s'il reste sans nom
-report = print                # remplacé par la barre d'état une fois la fenêtre ouverte
+    def __init__(self, network: Network, iface_arg: str | None, iface: str, subnet, my_ip: str, gateway: str | None,
+                 geo_reader=None, notes: list[str] | None = None):
+        self.network = network
+        self.iface_arg = iface_arg  # tel que donné par --iface : None = suivre la route par défaut
+        self.iface, self.subnet, self.my_ip, self.gateway = iface, subnet, my_ip, gateway
+        self.geo_reader = geo_reader
+        self.notes = notes if notes is not None else []  # remarques durables affichées dans la barre d'état
+        # set : l'ordre des adresses IPv6 peut varier
+        self.started_on = (iface, subnet, my_ip, gateway), set(capture.local_prefixes6(iface))
+        self.identified: set[str] = set()  # chaque appareil n'est identifié qu'une fois, même s'il reste sans nom
+        self.report = print                # remplacé par la barre d'état une fois la fenêtre ouverte
+        self.sniffer = None
+        self.capture_paused = False  # le message de coupure est affiché : à effacer dès que la capture tourne à nouveau
+
+    def status(self, message: str = "") -> None:
+        self.report(" · ".join([message, *self.notes] if message else self.notes))
+
+    def identify_new(self) -> None:
+        new = set(self.network.nodes) - self.identified
+        discovery.identify(self.network, new)
+        self.identified.update(new)
+
+    def rescan(self) -> None:
+        discovery.scan(self.network, self.iface)
+        # Retrait d'abord : une erreur d'identification ne doit pas laisser les appareils partis à l'écran.
+        for ip in self.network.prune(MAX_AGE):
+            self.identified.discard(ip)  # s'il revient, il sera identifié à nouveau
+        self.identify_new()
+
+    def watch_network(self) -> None:
+        """Interface, sous-réseau, adresses et passerelle sont fixés au démarrage : s'ils changent, tout devient faux."""
+        try:
+            now = discovery.current_network(self.iface_arg), set(capture.local_prefixes6(self.iface))
+        except RuntimeError:
+            now = None  # plus de réseau du tout (Wi-Fi coupé) : la surveillance de la capture le signale déjà
+        note = "Réseau changé depuis le lancement : relance Spaghet pour le cartographier"
+        if now and now != self.started_on and note not in self.notes:
+            self.notes.insert(0, note)
+            self.status()
+
+    def watch_capture(self) -> None:
+        self.sniffer, error = capture.ensure_running(self.sniffer)
+        if isinstance(error, PermissionError):
+            self.status(NO_RIGHTS)
+        elif error:
+            # Interface coupée (veille, Wi-Fi) : chaque relance échoue jusqu'à son retour, le message reste le même.
+            self.capture_paused = True
+            self.status(f"Capture en pause, nouvel essai toutes les 5 s ({error})")
+        elif self.capture_paused:
+            self.capture_paused = False  # la relance précédente a tenu
+            self.status()
+
+    def start(self, report_to_window) -> None:
+        """Démarrage, une fois la fenêtre ouverte. La capture d'abord : le reste n'est qu'un enrichissement."""
+        self.report = report_to_window
+        self.sniffer = capture.start(self.network, self.iface, self.subnet, self.geo_reader, self.gateway)
+        every(1, self.network.tick)
+        every(5, self.watch_capture)
+        every(30, self.watch_network)
+        # Avant le premier scan : s'il échoue (Wi-Fi pas encore prêt après la veille), le rescan prendra le relais.
+        every(PROBE_INTERVAL, probes.ping_all, self.network, self.iface, self.my_ip)
+        every(RESCAN_INTERVAL, self.rescan)
+        try:
+            self.status("Scan ARP du réseau local…")
+            if discovery.scan(self.network, self.iface):
+                self.notes.insert(0, "Proxy ARP détecté : seuls les appareils en contact avec cette machine apparaissent")
+            self.status(f"{len(self.network.nodes)} appareils trouvés, identification…")
+            self.identify_new()
+            self.status("Mesure de la latence…")
+            probes.ping_all(self.network, self.iface, self.my_ip)
+            self.status()
+        except PermissionError:
+            self.status(NO_RIGHTS)
+        except Exception as e:
+            self.status(f"Découverte incomplète : {e}")
 
 
-def status(message: str = "") -> None:
-    report(" · ".join([message, *notes] if message else notes))
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="spaghet")
+    parser.add_argument("--iface", help="interface réseau (par défaut : celle de la route par défaut)")
+    parser.add_argument("--geoip", help=f"base GeoIP .mmdb (par défaut : $SPAGHET_GEOIP ou {geo.DEFAULT_PATH})")
+    args = parser.parse_args()
 
-
-def identify_new() -> None:
-    new = set(network.nodes) - identified
-    discovery.identify(network, new)
-    identified.update(new)
-
-
-def rescan() -> None:
-    discovery.scan(network, iface)
-    identify_new()
-    for ip in network.prune(MAX_AGE):
-        identified.discard(ip)  # s'il revient, il sera identifié à nouveau
-
-
-def watch_network() -> None:
-    """Interface, sous-réseau, adresses et passerelle sont fixés au démarrage : s'ils changent, tout devient faux."""
     try:
-        now = discovery.current_network(args.iface), set(capture.local_prefixes6(iface))
-    except RuntimeError:
-        now = None  # plus de réseau du tout (Wi-Fi coupé) : la surveillance de la capture le signale déjà
-    note = "Réseau changé depuis le lancement : relance Spaghet pour le cartographier"
-    if now and now != started_on and note not in notes:
-        notes.insert(0, note)
-        status()
-
-
-def watch_capture() -> None:
-    global sniffer
-    sniffer, error = capture.ensure_running(sniffer)
-    if isinstance(error, PermissionError):
-        status("Droits réseau manquants : ferme Spaghet, lance ./setcap.sh une fois, puis relance avec ./spaghet.sh")
-    elif error:
-        status(f"Capture relancée après une coupure ({error})")
-
-
-def backend(report_to_window) -> None:
-    """Démarrage, une fois la fenêtre ouverte. La capture d'abord : le reste n'est qu'un enrichissement."""
-    global report, sniffer
-    report = report_to_window
-    sniffer = capture.start(network, iface, subnet, geo_reader, gateway)
-    every(1, network.tick)
-    every(5, watch_capture)
-    every(30, watch_network)
+        iface, subnet, my_ip, gateway = discovery.local_network(args.iface)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    notes: list[str] = []
     try:
-        status("Scan ARP du réseau local…")
-        if discovery.scan(network, iface):
-            notes.insert(0, "Proxy ARP détecté : seuls les appareils en contact avec cette machine apparaissent")
-        every(PROBE_INTERVAL, probes.ping_all, network, iface, my_ip)
-        every(RESCAN_INTERVAL, rescan)
-        status(f"{len(network.nodes)} appareils trouvés, identification…")
-        identify_new()
-        status("Mesure de la latence…")
-        probes.ping_all(network, iface, my_ip)
-        status()
-    except PermissionError:
-        status("Droits réseau manquants : ferme Spaghet, lance ./setcap.sh une fois, puis relance avec ./spaghet.sh")
-    except Exception as e:
-        status(f"Découverte incomplète : {e}")
+        geo_reader = geo.load(args.geoip)
+        if not geo_reader:
+            notes.append(f"Lieux inconnus : pas de base {geo.path_for(args.geoip)}")
+    except ValueError as e:
+        geo_reader = None
+        notes.append(f"Lieux inconnus : {e}")
+    backend = Backend(Network(), args.iface, iface, subnet, my_ip, gateway, geo_reader, notes)
+    # os._exit : ne pas attendre les threads de fond (recherches DNS en cours…) une fois la fenêtre fermée.
+    os._exit(gui.run(backend.network, backend.start))
 
 
-# os._exit : ne pas attendre les threads de fond (recherches DNS en cours…) une fois la fenêtre fermée.
-os._exit(gui.run(network, backend))
+if __name__ == "__main__":
+    main()

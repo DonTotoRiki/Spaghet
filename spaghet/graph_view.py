@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QWidget
 
 # type → (couleur, libellé). Pas d'emoji : Qt ne les affiche pas partout de façon fiable.
@@ -36,8 +36,12 @@ CLOUD_GAP = 40         # distance minimale entre un appareil du LAN et le cadre 
 STALE_AFTER = 60      # s sans réponse avant de griser un appareil (retiré à 5 min par le moteur)
 ACTIVE_BPS = 1000     # en dessous, pas de particules
 MAX_ANIMATED = 40     # particules seulement sur les liens les plus actifs : au-delà, le dessin dépasse 33 ms par image
-BACKGROUND = QColor("#111111")
+BACKGROUND = QColor("#101216")
+BACKGROUND_CENTER = QColor("#191c22")  # dégradé radial : le centre du graphe ressort légèrement
+LABEL_BG = QColor(12, 13, 17, 200)     # pastille sous les étiquettes : lisibles même posées sur un lien
+LABEL_TEXT, LABEL_DIM = QColor("#e8eaed"), QColor("#8b919a")
 LABEL_POINTS = 9      # taille des étiquettes à l'écran, quel que soit le zoom
+RELAYOUT_LENGTH = 15  # écart de longueur idéale (unités du graphe) qui relance la disposition ; en dessous, invisible
 
 
 def kind_of(node: dict) -> tuple[str, str]:
@@ -104,6 +108,7 @@ class GraphView(QWidget):
         self._moved = False
         self._cloud_label = QRectF()
         self._animating = False  # au moins un lien a des particules : il faut redessiner à chaque image
+        self._lengths: dict[str, float] = {}  # longueur idéale de chaque nœud à la dernière relance de la disposition
         self.font = QFont()
 
         self._timer = QTimer(self)
@@ -118,6 +123,11 @@ class GraphView(QWidget):
     def update_data(self, snapshot: dict) -> None:
         nodes = {n["ip"]: n for n in snapshot["nodes"]}
         changed = nodes.keys() != self.nodes.keys() or {(l["a"], l["b"]) for l in snapshot["links"]} != self.links.keys()
+        # Longueur = latence : une latence qui a nettement changé depuis la dernière disposition la relance aussi.
+        # Comparé à la dernière relance, pas à la seconde précédente : une dérive lente finit par compter.
+        lengths = {i: ideal_length(n.get("rtt_ms")) for i, n in nodes.items()}
+        changed = changed or any(abs(length - self._lengths.get(i, length)) > RELAYOUT_LENGTH
+                                 for i, length in lengths.items())
         self.nodes = nodes
         self.links = {(l["a"], l["b"]): l for l in snapshot["links"]}
         for gone in self.pos.keys() - nodes.keys() - {CLOUD}:
@@ -134,6 +144,7 @@ class GraphView(QWidget):
             self.selected = None
         self.update()  # débits, latences, étiquettes : une fois par seconde suffit
         if changed:
+            self._lengths = lengths
             self.temperature = max(self.temperature, 20.0)
             if not self._fitted and nodes:
                 for _ in range(300):  # premier affichage : on pose le graphe d'un coup puis on cadre
@@ -256,7 +267,7 @@ class GraphView(QWidget):
         xs, ys = zip(*(self.pos[i] for i in ids))
         # Marge : au moins celle du cadre Internet (CLOUD_PAD), sinon le cadrage le coupe au bord de l'écran.
         mx = CLOUD_PAD[0] + 20
-        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-mx, -50, mx, 70)
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-mx, -80, mx, 70)
 
     def cloud_box(self, internet: list[str]) -> QRectF:
         """Cadre « Internet » dessiné autour des destinations, avec la place de leurs étiquettes."""
@@ -289,19 +300,20 @@ class GraphView(QWidget):
         animating = False
         if internet:
             box = self.cloud_box(internet)
-            p.setPen(QPen(QColor("#555555"), 1))
-            p.setBrush(QColor(255, 255, 255, 12))
-            p.drawRoundedRect(box, 12, 12)
-            self._cloud_label = QRectF(box.left() + 8, box.top() + 4, 30 * line_height, line_height)
-            p.setPen(QColor("#bbbbbb"))
-            p.drawText(self._cloud_label, Qt.AlignLeft | Qt.AlignVCenter, f"Internet ({len(internet)}) — clic pour replier")
+            p.setPen(QPen(QColor("#2c3139"), 1.5))
+            p.setBrush(QColor(255, 255, 255, 8))
+            p.drawRoundedRect(box, 16, 16)
+            # Titre au-dessus du cadre : à l'intérieur, il recouvrait les destinations du haut.
+            self._cloud_label = QRectF(box.left() + 6, box.top() - line_height - 4, 30 * line_height, line_height)
+            p.setPen(LABEL_DIM)
+            p.drawText(self._cloud_label, Qt.AlignLeft | Qt.AlignVCenter, f"INTERNET · {len(internet)}   — clic pour replier")
 
         busy = [k for k, e in enumerate(edges) if e[3] != "star" and e[2].get("bps", 0) > ACTIVE_BPS]
         animated = set(sorted(busy, key=lambda k: edges[k][2]["bps"], reverse=True)[:MAX_ANIMATED])
         for k, (a, b, link, kind) in enumerate(edges):
             pa, pb = QPointF(*self.pos[a]), QPointF(*self.pos[b])
             if kind == "star":
-                p.setPen(QPen(QColor("#555555"), 1, Qt.DashLine))
+                p.setPen(QPen(QColor("#3a404a"), 1, Qt.DashLine))
                 p.drawLine(pa, pb)
                 continue
             proto = main_protocol(link)
@@ -325,40 +337,90 @@ class GraphView(QWidget):
                 for s in particle_positions(length, bps, now, link.get("bps_ab", 0) >= bps / 2):
                     p.drawEllipse(pa + d * (s / length), r, r)
 
+        metrics = QFontMetricsF(self.font, p.device())
+        pad = metrics.height() * 0.4
         for node_id in ids:
             x, y = self.pos[node_id]
             if node_id == CLOUD:
                 color, radius = "#888888", 18
                 label = f"Internet ({sum(1 for n in self.nodes.values() if n.get('kind') == 'internet')})"
+                detail = ""
                 stale = False
             else:
                 node = self.nodes[node_id]
                 color, _ = kind_of(node)
-                radius = 14 if node.get("kind") == "router" else 9
+                radius = 15 if node.get("kind") == "router" else 10
                 label = name_of(node)
                 if len(label) > 28:
                     label = label[:27] + "…"
-                if node.get("rtt_ms") is not None:
-                    label += f" · {node['rtt_ms']:.1f} ms"
+                detail = f"  {node['rtt_ms']:.1f} ms" if node.get("rtt_ms") is not None else ""
                 stale = now - node.get("last_seen", now) > STALE_AFTER
             p.setOpacity(0.3 if stale else 1.0)
+            center = QPointF(x, y)
             fill = QColor(color)
-            p.setPen(QPen(QColor("#ffffff"), 3) if node_id == self.selected else Qt.NoPen)
+            halo = QColor(fill)
+            halo.setAlpha(110 if node_id == self.selected else 45)
+            p.setPen(Qt.NoPen)
+            p.setBrush(halo)
+            p.drawEllipse(center, radius + (9 if node_id == self.selected else 5), radius + (9 if node_id == self.selected else 5))
+            # Liseré couleur du fond : le nœud se détache des liens qui y arrivent.
+            p.setPen(QPen(QColor("#ffffff"), 2.5) if node_id == self.selected else QPen(BACKGROUND, 2))
             p.setBrush(fill)
-            p.drawEllipse(QPointF(x, y), radius, radius)
-            p.setPen(QColor("#eeeeee"))
-            p.drawText(QRectF(x - 20 * line_height, y + radius + 2, 40 * line_height, line_height),
-                       Qt.AlignHCenter | Qt.AlignTop, label)
+            p.drawEllipse(center, radius, radius)
+
+            # Étiquette : nom en clair, latence en gris, sur une pastille sombre.
+            name_w, detail_w = metrics.horizontalAdvance(label), metrics.horizontalAdvance(detail)
+            box = QRectF(x - (name_w + detail_w) / 2 - pad, y + radius + 4, name_w + detail_w + 2 * pad, metrics.height() + 2)
+            p.setPen(Qt.NoPen)
+            p.setBrush(LABEL_BG)
+            p.drawRoundedRect(box, box.height() / 2, box.height() / 2)
+            baseline = box.top() + 1 + metrics.ascent()
+            p.setPen(LABEL_TEXT)
+            p.drawText(QPointF(box.left() + pad, baseline), label)
+            if detail:
+                p.setPen(LABEL_DIM)
+                p.drawText(QPointF(box.left() + pad + name_w, baseline), detail)
             p.setOpacity(1.0)
         self._animating = animating
 
+    def _draw_legend(self, p: QPainter) -> None:
+        """Légende des types d'appareils, en bas à gauche de la vue (coordonnées de l'écran)."""
+        font = QFont(self.font)
+        font.setPointSizeF(LABEL_POINTS)
+        p.setFont(font)
+        metrics = QFontMetricsF(font, p.device())
+        row = metrics.height() + 4
+        width = 26 + max(metrics.horizontalAdvance(label) for _, label in KINDS.values()) + 12
+        box = QRectF(12, self.height() - 12 - row * len(KINDS) - 12, width, row * len(KINDS) + 12)
+        p.setPen(QPen(QColor("#2c3139"), 1))
+        p.setBrush(QColor(16, 18, 22, 215))
+        p.drawRoundedRect(box, 8, 8)
+        for k, (color, label) in enumerate(KINDS.values()):
+            y = box.top() + 6 + k * row + row / 2
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(color))
+            p.drawEllipse(QPointF(box.left() + 14, y), 5, 5)
+            p.setPen(LABEL_DIM)
+            p.drawText(QPointF(box.left() + 26, y + metrics.ascent() / 2 - 1), label)
+
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
-        p.fillRect(self.rect(), BACKGROUND)
+        gradient = QRadialGradient(QPointF(self.width() / 2, self.height() / 2), max(self.width(), self.height()) * 0.7)
+        gradient.setColorAt(0, BACKGROUND_CENTER)
+        gradient.setColorAt(1, BACKGROUND)
+        p.fillRect(self.rect(), gradient)
+        p.save()
         p.translate(self.width() / 2 + self.offset.x(), self.height() / 2 + self.offset.y())
         p.scale(self.zoom, self.zoom)
         self.draw(p, time.time(), self.zoom)
+        p.restore()
+        self._draw_legend(p)
         p.end()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._auto_fit:  # fenêtre agrandie ou panneau ouvert : le graphe garde toute la place disponible
+            self.fit()
 
     def export_png(self, path: str) -> bool:
         """Image du graphe entier (pas seulement la partie visible), en double résolution."""
@@ -433,7 +495,10 @@ class GraphView(QWidget):
         self.relayout()
 
     def wheelEvent(self, event) -> None:
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        dy = event.angleDelta().y()
+        if not dy:
+            return  # défilement horizontal : pas un zoom
+        factor = 1.15 ** (dy / 120)  # proportionnel : un pavé tactile envoie beaucoup de petits crans
         new_zoom = max(0.1, min(5.0, self.zoom * factor))
         g = self._to_graph(event.position())  # le point sous la souris reste fixe
         self.offset += g * (self.zoom - new_zoom)

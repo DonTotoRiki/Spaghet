@@ -32,3 +32,13 @@ def test_unreadable_base_is_reported_not_fatal(tmp_path):
     with pytest.raises(ValueError, match="illisible"):
         load(str(path))
     assert load(str(tmp_path / "absent.mmdb")) is None
+
+
+def test_geoip_path_order(monkeypatch):
+    from spaghet.geo import path_for
+
+    monkeypatch.delenv("SPAGHET_GEOIP", raising=False)
+    assert path_for() == "geoip.mmdb"
+    monkeypatch.setenv("SPAGHET_GEOIP", "/data/villes.mmdb")
+    assert path_for() == "/data/villes.mmdb"  # le message « pas de base » doit nommer ce fichier-là
+    assert path_for("autre.mmdb") == "autre.mmdb"

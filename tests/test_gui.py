@@ -1,14 +1,14 @@
+import math
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # pas besoin d'écran pour tester
 
 import pytest
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import QApplication
 
 from spaghet.graph_view import CLOUD, main_protocol, particle_positions
 from spaghet.gui import MainWindow
-from spaghet.map_view import project
 from spaghet.model import Network
 
 GW, PC, TV = "192.168.1.1", "192.168.1.10", "192.168.1.20"
@@ -49,19 +49,12 @@ def test_main_protocol():
     assert main_protocol({"protocols": {}}) == "other"
 
 
-def test_project_web_mercator():
-    assert project(0, 0, 0) == pytest.approx((128, 128))
-    x, y = project(48.85, 2.35, 2)  # Paris : moitié droite, moitié haute
-    assert 512 < x < 540 and y < 512
-
-
 def test_window_shows_network(app, tmp_path):
     window = MainWindow(sample_network())
     window.resize(1200, 800)
     window.refresh()
     graph = window.graph
     assert set(graph.pos) >= {GW, PC, TV, "googlevideo.com"}
-    assert window.map.points[0][0] == "googlevideo.com"
 
     window.select(PC)
     assert window.panel.isVisibleTo(window)
@@ -76,19 +69,6 @@ def test_window_shows_network(app, tmp_path):
 
     assert graph.export_png(str(tmp_path / "graphe.png"))
     assert (tmp_path / "graphe.png").stat().st_size > 1000
-
-
-def test_map_picks_the_closest_point(app):
-    from spaghet.map_view import MapView
-
-    m = MapView()
-    m.resize(800, 600)
-    small = m._screen(*project(0, 0, m.zoom))
-    shift = 12 / (256 * 2 ** m.zoom) * 360  # 12 px vers l'est
-    m.points = [("petit", 0.0, 0.0, "#f00", 4, ""), ("gros", 0.0, shift, "#0f0", 14, "")]
-    assert m.point_at(small)[0] == "petit"
-    assert m.point_at(small + QPointF(12, 0))[0] == "gros"
-    assert m.point_at(small + QPointF(200, 0)) is None
 
 
 def test_panel_keeps_its_rows_between_refreshes(app):
@@ -153,18 +133,6 @@ def test_click_radius_follows_zoom(app):
         on_screen = QPointF(400 + target[0] * zoom, 300 + target[1] * zoom)
         assert graph.node_at(on_screen + QPointF(10, 0)) == TV      # 10 px à côté : touché
         assert graph.node_at(on_screen + QPointF(40, 0)) != TV      # 40 px à côté : raté
-
-
-def test_map_points_follow_the_repeated_world(app):
-    from spaghet.map_view import MapView
-
-    m = MapView()
-    m.resize(800, 600)
-    m.points = [("paris", 48.85, 2.35, "#f00", 6, "")]
-    near = m._point_screen(48.85, 2.35)
-    m.center += QPointF(256 * 2 ** m.zoom, 0)  # un tour complet vers l'est
-    assert m._point_screen(48.85, 2.35) == near  # le point est toujours au même endroit à l'écran
-    assert m.point_at(near)[0] == "paris"
 
 
 def test_sizes_and_plurals_read_well():
@@ -242,3 +210,65 @@ def test_only_the_busiest_links_are_animated(app, monkeypatch):
     painter.end()
     assert len(animated) == graph_view.MAX_ANIMATED
     assert min(animated) > max(l.bps for l in net.links.values() if l.bps not in animated)  # les plus actifs
+
+
+def wheel(dy: int, dx: int = 0):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QWheelEvent
+
+    return QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(), QPoint(dx, dy),
+                       Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+
+
+def test_touchpad_and_sideways_scroll_zoom_gently(app):
+    from spaghet.graph_view import GraphView
+
+    g = GraphView()
+    g.resize(800, 600)
+    g.wheelEvent(wheel(0, dx=120))
+    assert g.zoom == 1.0
+    g.wheelEvent(wheel(12))
+    assert g.zoom == pytest.approx(1.15 ** 0.1)
+
+
+def test_new_latency_moves_the_node(app):
+    from spaghet.graph_view import GraphView
+
+    def snapshot(rtt):
+        return {"now": 0, "links": [], "nodes": [{"ip": "box", "kind": "router", "last_seen": 0},
+                                                  {"ip": "pc", "kind": "pc", "rtt_ms": rtt, "last_seen": 0}]}
+
+    def distance():
+        return math.dist(g.pos["box"], g.pos["pc"])
+
+    g = GraphView()
+    g.resize(800, 600)
+    g.update_data(snapshot(None))  # premier affichage, avant la première mesure de latence
+    for _ in range(400):
+        g._frame()
+    before = distance()
+    g.update_data(snapshot(80.0))
+    assert g.temperature > 0  # la disposition repart
+    for _ in range(400):
+        g._frame()
+    assert distance() > 1.5 * before  # 80 ms : lien nettement plus long
+    g.update_data(snapshot(82.0))
+    assert g.temperature == 0  # simple variation : le graphe reste calme
+
+
+def test_graph_refits_when_the_window_is_resized(app):
+    window = MainWindow(sample_network())
+    window.resize(800, 600)
+    window.show()
+    graph = window.graph
+    window.refresh()
+    small = graph.zoom
+    window.resize(1600, 1000)  # fenêtre agrandie : le graphe en profite
+    app.processEvents()
+    assert graph.zoom > small
+    graph._auto_fit = False    # l'utilisateur a choisi sa vue : on n'y touche plus
+    zoom = graph.zoom
+    window.resize(900, 700)
+    app.processEvents()
+    assert graph.zoom == zoom
+    window.close()

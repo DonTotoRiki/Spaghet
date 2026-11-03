@@ -89,3 +89,54 @@ def test_traceroute_intercepted_at_first_hop(monkeypatch):
     with pytest.raises(ValueError, match="interceptée"):
         probes.traceroute(net, "wikipedia.org")
     assert net.nodes["wikipedia.org"].hops is None
+
+
+def test_ping_all_keeps_the_real_answer_after_the_proxy(monkeypatch):
+    """Le proxy ARP répond avant l'appareil présent : la vraie réponse, arrivée en second, doit compter."""
+    from types import SimpleNamespace
+
+    from scapy.all import ARP
+
+    from spaghet import probes
+    from spaghet.model import Network
+
+    def fake_srp(packets, **k):
+        assert k.get("multi")  # sinon scapy ne garde que la première réponse, celle du proxy
+        p = packets[0]
+        p.sent_time = 100.0
+        return [(p, SimpleNamespace(hwsrc="9a:55:9a:55:9a:55", time=100.001)),
+                (p, SimpleNamespace(hwsrc="3c:22:fb:00:00:20", time=100.004)),
+                (p, SimpleNamespace(hwsrc="3c:22:fb:00:00:20", time=100.009))], []  # réponse répétée : ignorée
+
+    monkeypatch.setattr(probes, "srp", fake_srp)
+    net = Network()
+    net.upsert_node("192.168.1.20", mac="3c:22:fb:00:00:20", now=0.0)
+    probes.ping_all(net, "eth0", my_ip="192.168.1.10")
+    assert net.nodes["192.168.1.20"].rtt_ms == 4.0
+    assert net.nodes["192.168.1.20"].last_seen > 0.0
+
+
+def test_failed_traceroute_clears_the_old_hop_count(monkeypatch):
+    import pytest
+
+    from spaghet import probes
+    from spaghet.model import Network
+
+    traces = iter([
+        {"142.250.1.1": {9: ("142.250.1.1", True)}},          # 1er essai : 9 sauts
+        {"142.250.1.1": {1: ("192.168.1.1", False)}},         # 2e : la cible ne répond plus
+        {"142.250.1.1": {9: ("142.250.1.1", True)}},
+        {"142.250.1.1": {1: ("142.250.1.1", True)}},          # 4e : intercepté au premier saut
+    ])
+    result = lambda: type("R", (), {"get_trace": lambda self, t=next(traces): t})()
+    monkeypatch.setattr(probes, "scapy_traceroute", lambda *a, **k: (result(), None))
+    net = Network()
+    net.upsert_node("youtube.com", kind="internet", addr="142.250.1.1")
+
+    assert probes.traceroute(net, "youtube.com") == 9
+    assert probes.traceroute(net, "youtube.com") is None
+    assert net.nodes["youtube.com"].hops is None  # plus de « Sauts : 9 » à côté de « La cible n'a pas répondu »
+    probes.traceroute(net, "youtube.com")
+    with pytest.raises(ValueError, match="interceptée"):
+        probes.traceroute(net, "youtube.com")
+    assert net.nodes["youtube.com"].hops is None

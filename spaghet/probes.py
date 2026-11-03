@@ -23,10 +23,13 @@ def ping_all(network: Network, iface: str, my_ip: str, timeout: float = 2.0) -> 
     if not targets:
         return
     packets = [Ether(dst=n.mac) / ARP(pdst=n.ip) for n in targets]
-    answered, _ = srp(packets, iface=iface, timeout=timeout, verbose=False)
+    # multi : la réponse d'un proxy ARP peut arriver avant celle de l'appareil ; sans ça, la vraie serait jetée.
+    answered, _ = srp(packets, iface=iface, timeout=timeout, verbose=False, multi=True)
+    measured: set[str] = set()
     for sent, reply in answered:
-        if reply.hwsrc != sent[Ether].dst:
+        if reply.hwsrc != sent[Ether].dst or sent[ARP].pdst in measured:
             continue  # un proxy ARP répond aussi pour les appareils absents : seule la vraie MAC prouve la présence
+        measured.add(sent[ARP].pdst)
         rtt_ms = (reply.time - sent.sent_time) * 1000
         node = network.nodes.get(sent[ARP].pdst)
         old = node.rtt_ms if node else None
@@ -60,8 +63,13 @@ def _traceroute(network: Network, node_id: str, max_ttl: int) -> int | None:
     answered, _ = trace_fn(target, dport=443, maxttl=max_ttl, timeout=2, verbose=False)
     trace = answered.get_trace().get(target, {})
     hops = min((ttl for ttl, (_hop, reached) in trace.items() if reached), default=None)
-    if hops == 1 and node.kind == "internet":
-        # Au moins la box et le fournisseur d'accès séparent d'Internet : un équipement a répondu à la place de la cible.
+    # Au moins la box et le fournisseur d'accès séparent d'Internet : un équipement a répondu à la place de la cible.
+    intercepted = hops == 1 and node.kind == "internet"
+    if hops is None or intercepted:
+        # upsert_node n'écrase jamais par None : l'ancien nombre de sauts resterait affiché à côté du nouveau résultat.
+        node.hops = None
+    else:
+        network.upsert_node(node_id, seen=False, hops=hops)
+    if intercepted:
         raise ValueError("réponse interceptée par un équipement intermédiaire (proxy, NAT de machine virtuelle)")
-    network.upsert_node(node_id, seen=False, hops=hops)
     return hops

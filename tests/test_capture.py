@@ -220,3 +220,16 @@ def test_unreadable_dns_still_counts_as_traffic():
     garbage = Ether() / IP(src=GW, dst=PC) / UDP(sport=53, dport=40000) / Raw(b"\x12\x34\x81\x80\x00\x01\x00\x01" + b"\xff" * 8)
     handle(Ether(bytes(garbage)))
     assert net.links[link_key(PC, GW)].protocols == {"dns": len(garbage)}
+
+
+def test_private_addresses_outside_the_subnet_are_not_internet():
+    net = Network()
+    handle = make_handler(net, SUBNET, gateway=GW)
+    for other in ("10.8.0.1", "100.64.3.4", "192.168.50.2", "169.254.10.10"):  # VPN, CGNAT, autre box, lien local
+        handle(Ether() / IP(src=PC, dst=other) / TCP(sport=50000, dport=22))
+        assert link_key(PC, other) in net.links
+        assert net.nodes[other].kind != "internet"
+        assert "réseau privé" in net.nodes[other].name
+    assert UNRESOLVED not in net.nodes  # rien n'a été mélangé au vrai Internet
+    handle(Ether() / IP(src=PC, dst=UNKNOWN) / TCP(sport=50001, dport=443))
+    assert net.nodes[UNRESOLVED].kind == "internet"  # une IP publique reste une destination Internet

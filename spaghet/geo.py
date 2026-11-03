@@ -6,12 +6,17 @@ import maxminddb
 DEFAULT_PATH = "geoip.mmdb"
 
 
+def path_for(path: str | None = None) -> str:
+    """Chemin de la base réellement utilisé : --geoip, sinon $SPAGHET_GEOIP, sinon geoip.mmdb."""
+    return path or os.environ.get("SPAGHET_GEOIP") or DEFAULT_PATH
+
+
 def load(path: str | None = None):
     """Ouvre la base GeoIP, ou renvoie None si elle est absente : la géolocalisation est optionnelle.
 
     Lève ValueError si le fichier existe mais n'est pas lisible.
     """
-    path = path or os.environ.get("SPAGHET_GEOIP") or DEFAULT_PATH
+    path = path_for(path)
     if not os.path.exists(path):
         return None
     try:
