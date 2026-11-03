@@ -3,7 +3,7 @@ import random
 import time
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QWidget
 
@@ -14,8 +14,9 @@ KINDS = {
     "phone":    ("#7ed67e", "Téléphone"),
     "printer":  ("#c58cff", "Imprimante"),
     "iot":      ("#ffd84a", "Objet connecté"),
-    "internet": ("#888888", "Internet"),
-    "unknown":  ("#666666", "Inconnu"),
+    "private":  ("#5fc4b8", "Réseau privé"),  # VPN, autre box, CGNAT : ni le LAN scanné, ni Internet
+    "internet": ("#8b919a", "Internet"),
+    "unknown":  ("#4f6278", "Inconnu"),       # teinte froide : se distingue du gris « Internet »
 }
 # Mêmes catégories que spaghet/classify.py : catégorie → (libellé, couleur)
 PROTOCOLS = {
@@ -57,6 +58,14 @@ def main_protocol(link: dict) -> str:
     protocols = link.get("protocols") or {}
     key = max(protocols, key=protocols.get, default="other")
     return key if key in PROTOCOLS else "other"
+
+
+def opaque(color: str, opacity: float) -> QColor:
+    """Couleur mélangée au fond, sans transparence : un trait épais lissé et semi-transparent coûte ~8 fois plus
+    cher à tracer qu'un trait opaque (Qt doit éviter de le superposer à lui-même)."""
+    c, bg = QColor(color), BACKGROUND_CENTER
+    mix = lambda a, b: round(a * opacity + b * (1 - opacity))
+    return QColor(mix(c.red(), bg.red()), mix(c.green(), bg.green()), mix(c.blue(), bg.blue()))
 
 
 def edge_width(bps: float) -> float:
@@ -180,7 +189,8 @@ class GraphView(QWidget):
         if router:
             with_router = {a if b == router else b for a, b, _, kind in edges if router in (a, b) and kind == "traffic"}
             for i in ids:
-                if i not in internet and i not in (router, CLOUD) and i not in with_router:
+                if (i not in internet and i not in (router, CLOUD) and i not in with_router
+                        and self.nodes[i].get("kind") != "private"):
                     edges.append((router, i, {}, "star"))
         return ids, edges
 
@@ -276,12 +286,14 @@ class GraphView(QWidget):
         return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-px, -py, px, py)
 
     def fit(self) -> None:
-        """Cadre tout le graphe, et reprend le cadrage automatique (bouton « Recadrer »)."""
+        """Cadre tout le graphe à droite de la légende, et reprend le cadrage automatique (bouton « Recadrer »)."""
         self._auto_fit = True
         ids, _ = self._visible()
         r = self._bounds(ids)
-        self.zoom = max(0.2, min(2.0, min(self.width() / r.width(), self.height() / r.height()) * 0.95))
-        self.offset = -r.center() * self.zoom
+        legend = self._legend_rect(QFontMetricsF(self._legend_font()), self.height()).right()
+        width = max(100.0, self.width() - legend)
+        self.zoom = max(0.2, min(2.0, min(width / r.width(), self.height() / r.height()) * 0.95))
+        self.offset = QPointF(legend / 2, 0) - r.center() * self.zoom  # centre de la zone à droite de la légende
         self.update()
 
     def draw(self, p: QPainter, now: float, zoom: float = 1.0) -> None:
@@ -310,32 +322,37 @@ class GraphView(QWidget):
 
         busy = [k for k, e in enumerate(edges) if e[3] != "star" and e[2].get("bps", 0) > ACTIVE_BPS]
         animated = set(sorted(busy, key=lambda k: edges[k][2]["bps"], reverse=True)[:MAX_ANIMATED])
+        # Liens groupés par stylo, un seul drawLines par groupe : un drawLine par lien prenait la moitié du temps
+        # de dessin au-delà de 300 liens. Épaisseur arrondie au demi-pixel pour que les groupes restent peu nombreux.
+        lines: dict[tuple, list[QLineF]] = {}  # (couleur, opacité, épaisseur, style) → segments
+        particles = []
         for k, (a, b, link, kind) in enumerate(edges):
-            pa, pb = QPointF(*self.pos[a]), QPointF(*self.pos[b])
+            segment = QLineF(QPointF(*self.pos[a]), QPointF(*self.pos[b]))
             if kind == "star":
-                p.setPen(QPen(QColor("#3a404a"), 1, Qt.DashLine))
-                p.drawLine(pa, pb)
+                lines.setdefault(("#3a404a", 1.0, 1.0, Qt.DashLine), []).append(segment)
                 continue
             proto = main_protocol(link)
             if proto in self.hidden_protocols:
                 continue
-            color = QColor(PROTOCOLS[proto][1])
             bps = link.get("bps", 0)
             active = k in animated
-            line = QColor(color)
-            line.setAlphaF(0.35 if active else 0.8)
-            # Bouts plats : les bouts ronds doublent le temps de tracé des traits épais lissés.
-            p.setPen(QPen(line, edge_width(bps), Qt.DotLine if kind == "agg" else Qt.SolidLine, Qt.FlatCap))
-            p.drawLine(pa, pb)
+            style = Qt.DotLine if kind == "agg" else Qt.SolidLine
+            width = round(edge_width(bps) * 2) / 2
+            lines.setdefault((PROTOCOLS[proto][1], 0.35 if active else 0.8, width, style), []).append(segment)
             if active:
-                animating = True
-                d = pb - pa
-                length = math.hypot(d.x(), d.y())
-                p.setPen(Qt.NoPen)
-                p.setBrush(color.lighter(130))
-                r = edge_width(bps) / 2 + 1
-                for s in particle_positions(length, bps, now, link.get("bps_ab", 0) >= bps / 2):
-                    p.drawEllipse(pa + d * (s / length), r, r)
+                particles.append((segment, PROTOCOLS[proto][1], bps, link.get("bps_ab", 0) >= bps / 2))
+        for (color, opacity, width, style), segments in lines.items():
+            # Bouts plats : les bouts ronds doublent le temps de tracé des traits épais lissés.
+            p.setPen(QPen(opaque(color, opacity), width, style, Qt.FlatCap))
+            p.drawLines(segments)
+        p.setPen(Qt.NoPen)
+        for segment, color, bps, toward_b in particles:
+            animating = True
+            p.setBrush(QColor(color).lighter(130))
+            r = edge_width(bps) / 2 + 1
+            length = segment.length()
+            for s in particle_positions(length, bps, now, toward_b):
+                p.drawEllipse(segment.pointAt(s / length), r, r)
 
         metrics = QFontMetricsF(self.font, p.device())
         pad = metrics.height() * 0.4
@@ -383,15 +400,25 @@ class GraphView(QWidget):
             p.setOpacity(1.0)
         self._animating = animating
 
-    def _draw_legend(self, p: QPainter) -> None:
-        """Légende des types d'appareils, en bas à gauche de la vue (coordonnées de l'écran)."""
+    def _legend_font(self) -> QFont:
         font = QFont(self.font)
         font.setPointSizeF(LABEL_POINTS)
+        return font
+
+    @staticmethod
+    def _legend_rect(metrics: QFontMetricsF, height: float) -> QRectF:
+        """Cadre de la légende, en bas à gauche d'une zone de cette hauteur."""
+        row = metrics.height() + 4
+        width = 26 + max(metrics.horizontalAdvance(label) for _, label in KINDS.values()) + 12
+        return QRectF(12, height - 12 - row * len(KINDS) - 12, width, row * len(KINDS) + 12)
+
+    def _draw_legend(self, p: QPainter, height: float) -> None:
+        """Légende des types d'appareils, en bas à gauche (coordonnées de l'écran ou de l'image exportée)."""
+        font = self._legend_font()
         p.setFont(font)
         metrics = QFontMetricsF(font, p.device())
         row = metrics.height() + 4
-        width = 26 + max(metrics.horizontalAdvance(label) for _, label in KINDS.values()) + 12
-        box = QRectF(12, self.height() - 12 - row * len(KINDS) - 12, width, row * len(KINDS) + 12)
+        box = self._legend_rect(metrics, height)
         p.setPen(QPen(QColor("#2c3139"), 1))
         p.setBrush(QColor(16, 18, 22, 215))
         p.drawRoundedRect(box, 8, 8)
@@ -403,18 +430,22 @@ class GraphView(QWidget):
             p.setPen(LABEL_DIM)
             p.drawText(QPointF(box.left() + 26, y + metrics.ascent() / 2 - 1), label)
 
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        gradient = QRadialGradient(QPointF(self.width() / 2, self.height() / 2), max(self.width(), self.height()) * 0.7)
+    @staticmethod
+    def _paint_background(p: QPainter, rect: QRectF) -> None:
+        gradient = QRadialGradient(rect.center(), max(rect.width(), rect.height()) * 0.7)
         gradient.setColorAt(0, BACKGROUND_CENTER)
         gradient.setColorAt(1, BACKGROUND)
-        p.fillRect(self.rect(), gradient)
+        p.fillRect(rect, gradient)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        self._paint_background(p, QRectF(self.rect()))
         p.save()
         p.translate(self.width() / 2 + self.offset.x(), self.height() / 2 + self.offset.y())
         p.scale(self.zoom, self.zoom)
         self.draw(p, time.time(), self.zoom)
         p.restore()
-        self._draw_legend(p)
+        self._draw_legend(p, self.height())
         p.end()
 
     def resizeEvent(self, event) -> None:
@@ -428,11 +459,14 @@ class GraphView(QWidget):
         r = self._bounds(ids).adjusted(-20, -20, 20, 20)
         scale = min(2.0, 8000 / max(r.width(), r.height()))
         image = QImage(int(r.width() * scale), int(r.height() * scale), QImage.Format_ARGB32)
-        image.fill(BACKGROUND)
         p = QPainter(image)
+        self._paint_background(p, QRectF(image.rect()))
         p.scale(scale, scale)
         p.translate(-r.topLeft())
         self.draw(p, time.time())
+        p.resetTransform()
+        p.scale(scale, scale)  # légende à la même échelle que le graphe exporté
+        self._draw_legend(p, image.height() / scale)
         p.end()
         return image.save(path)
 

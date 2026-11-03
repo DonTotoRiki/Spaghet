@@ -10,18 +10,23 @@ from spaghet.model import Network
 PROBE_INTERVAL = 10   # mesure de latence
 RESCAN_INTERVAL = 60  # scan ARP pour trouver les nouveaux appareils
 MAX_AGE = 300         # un appareil muet depuis 5 min est retiré
+PROXY_NOTE = "Proxy ARP détecté : seuls les appareils en contact avec cette machine apparaissent"
 NO_RIGHTS = "Droits réseau manquants : ferme Spaghet, lance ./setcap.sh une fois, puis relance avec ./spaghet.sh"
 
 
 def every(seconds: float, fn, *args) -> None:
     """Lance fn(*args) toutes les `seconds` secondes dans un thread de fond."""
     def loop():
+        last = None  # même erreur à chaque tournée (droits manquants…) : affichée une seule fois
         while True:
             time.sleep(seconds)
             try:
                 fn(*args)
+                last = None
             except Exception as e:  # une tournée ratée ne doit pas tuer la boucle
-                print(f"{fn.__name__} : {e}")
+                if str(e) != last:
+                    print(f"{fn.__name__} : {e}", flush=True)
+                last = str(e)
 
     threading.Thread(target=loop, name=fn.__name__, daemon=True).start()
 
@@ -39,6 +44,7 @@ class Backend:
         # set : l'ordre des adresses IPv6 peut varier
         self.started_on = (iface, subnet, my_ip, gateway), set(capture.local_prefixes6(iface))
         self.identified: set[str] = set()  # chaque appareil n'est identifié qu'une fois, même s'il reste sans nom
+        self._identifying = threading.Lock()  # le premier rescan peut tomber pendant une identification lente
         self.report = print                # remplacé par la barre d'état une fois la fenêtre ouverte
         self.sniffer = None
         self.capture_paused = False  # le message de coupure est affiché : à effacer dès que la capture tourne à nouveau
@@ -47,12 +53,23 @@ class Backend:
         self.report(" · ".join([message, *self.notes] if message else self.notes))
 
     def identify_new(self) -> None:
-        new = set(self.network.nodes) - self.identified
-        discovery.identify(self.network, new)
-        self.identified.update(new)
+        if not self._identifying.acquire(blocking=False):
+            return  # déjà en cours : les nouveaux appareils seront pris au prochain rescan
+        try:
+            new = set(self.network.nodes) - self.identified
+            discovery.identify(self.network, new)
+            self.identified.update(new)
+        finally:
+            self._identifying.release()
+
+    def scan(self) -> None:
+        """Scan ARP ; signale le proxy ARP la première fois qu'il est vu, même si le premier scan avait échoué."""
+        if discovery.scan(self.network, self.iface) and PROXY_NOTE not in self.notes:
+            self.notes.insert(0, PROXY_NOTE)
+            self.status()
 
     def rescan(self) -> None:
-        discovery.scan(self.network, self.iface)
+        self.scan()
         # Retrait d'abord : une erreur d'identification ne doit pas laisser les appareils partis à l'écran.
         for ip in self.network.prune(MAX_AGE):
             self.identified.discard(ip)  # s'il revient, il sera identifié à nouveau
@@ -93,8 +110,7 @@ class Backend:
         every(RESCAN_INTERVAL, self.rescan)
         try:
             self.status("Scan ARP du réseau local…")
-            if discovery.scan(self.network, self.iface):
-                self.notes.insert(0, "Proxy ARP détecté : seuls les appareils en contact avec cette machine apparaissent")
+            self.scan()
             self.status(f"{len(self.network.nodes)} appareils trouvés, identification…")
             self.identify_new()
             self.status("Mesure de la latence…")

@@ -12,7 +12,7 @@ class Node:
     mac: str | None = None
     name: str | None = None
     vendor: str | None = None
-    kind: str = "unknown"  # "router", "phone", "pc", "printer", "iot", "internet", "unknown"
+    kind: str = "unknown"  # "router", "phone", "pc", "printer", "iot", "private", "internet", "unknown"
     rtt_ms: float | None = None
     hops: int | None = None
     bytes_total: int = 0

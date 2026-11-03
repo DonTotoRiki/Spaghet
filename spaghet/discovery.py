@@ -150,7 +150,8 @@ def _optional(fn, *args) -> dict:
 
 def identify(network: Network, ips, timeout: float = 3.0) -> None:
     """Fabricant, nom et type des appareils du LAN donnés. Le premier nom trouvé gagne : DNS inverse, mDNS, NetBIOS."""
-    nodes = [n for ip in ips if (n := network.nodes.get(ip)) and n.kind != "internet"]
+    # Seulement le LAN : jamais de requête vers une destination Internet ou une adresse privée d'un autre réseau.
+    nodes = [n for ip in ips if (n := network.nodes.get(ip)) and n.kind not in ("internet", "private")]
     if not nodes:
         return
     names: dict[str, str] = {}

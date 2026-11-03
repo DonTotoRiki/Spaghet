@@ -116,6 +116,13 @@ def app_icon() -> QIcon:
     return QIcon(pixmap)
 
 
+def strike(box: QCheckBox, on: bool) -> None:
+    """Pastille désactivée : texte barré, pour un état lisible sans la couleur (la feuille de style ne sait pas le faire)."""
+    font = box.font()
+    font.setStrikeOut(not on)
+    box.setFont(font)
+
+
 def section(text: str) -> QLabel:
     label = QLabel(text.upper())
     label.setObjectName("section")
@@ -293,6 +300,8 @@ class MainWindow(QMainWindow):
         internet = QCheckBox("Internet")
         internet.setObjectName("chip")
         internet.setIcon(swatch(KINDS["internet"][0], round_=True))
+        internet.setToolTip("Afficher ou masquer les destinations Internet")
+        internet.setAccessibleName("Destinations Internet")
         internet.setChecked(True)
         internet.toggled.connect(self._toggle_internet)
         bar.addWidget(internet)
@@ -304,6 +313,7 @@ class MainWindow(QMainWindow):
             box = QCheckBox(label)
             box.setObjectName("chip")  # case cachée : la pastille de couleur s'éteint quand le protocole est masqué
             box.setToolTip(f"Afficher ou masquer les liens « {label} »")
+            box.setAccessibleName(f"Liens {label}")
             box.setIcon(swatch(color))
             box.setChecked(True)
             box.toggled.connect(lambda on, k=key, b=box, c=color: self._toggle_protocol(k, on, b, c))
@@ -332,19 +342,23 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _update_status(self) -> None:
-        lan = sum(1 for n in self.snapshot["nodes"] if n.get("kind") != "internet")
-        internet = len(self.snapshot["nodes"]) - lan
-        counts = f"{plural(lan, 'appareil')} · {plural(internet, 'destination')} Internet"
+        kinds = [n.get("kind") for n in self.snapshot["nodes"]]
+        internet, private = kinds.count("internet"), kinds.count("private")
+        counts = f"{plural(len(kinds) - internet - private, 'appareil')} · {plural(internet, 'destination')} Internet"
+        if private:
+            counts += f" · {plural(private, 'adresse')} {'privées' if private > 1 else 'privée'}"
         text = f"{counts} — {self.status_message}" if self.status_message else counts
         self.status_label.setText(text)
         self.status_label.setToolTip(text)
 
     def _toggle_internet(self, on: bool) -> None:
+        strike(self.sender(), on)
         self.graph.show_internet = on
         self.graph.relayout()
 
     def _toggle_protocol(self, key: str, on: bool, box: QCheckBox, color: str) -> None:
         box.setIcon(swatch(color if on else "#3a404a"))
+        strike(box, on)
         (self.graph.hidden_protocols.discard if on else self.graph.hidden_protocols.add)(key)
         self.graph.update()
 

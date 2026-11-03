@@ -58,3 +58,56 @@ def test_network_change_is_noted_once(backend, monkeypatch):
     backend.watch_network()
     assert backend.notes == ["Réseau changé depuis le lancement : relance Spaghet pour le cartographier"]
     assert len(backend.messages) == 1
+
+
+def test_identification_never_runs_twice_at_once(backend, monkeypatch):
+    calls = []
+
+    def identify(network, ips):
+        calls.append(set(ips))
+        backend.identify_new()  # le rescan tombe pendant cette identification : il ne doit rien relancer
+
+    monkeypatch.setattr(app.discovery, "identify", identify)
+    backend.network.upsert_node("192.168.1.20")
+    backend.identify_new()
+    assert calls == [{"192.168.1.20"}]
+    backend.network.upsert_node("192.168.1.21")
+    monkeypatch.setattr(app.discovery, "identify", lambda network, ips: calls.append(set(ips)))
+    backend.identify_new()  # le verrou a bien été rendu
+    assert calls[-1] == {"192.168.1.21"}
+
+
+def test_proxy_note_appears_when_only_a_rescan_succeeds(backend, monkeypatch):
+    monkeypatch.setattr(app.discovery, "scan", lambda network, iface: {"9a:55:9a:55:9a:55"})
+    monkeypatch.setattr(app.discovery, "identify", lambda network, ips: None)
+    backend.rescan()
+    backend.rescan()
+    assert backend.notes == [app.PROXY_NOTE]  # une seule fois
+    assert backend.messages == [app.PROXY_NOTE]  # affichée tout de suite
+
+
+def test_repeated_error_is_printed_once(monkeypatch, capsys):
+    class Stop(Exception):
+        pass
+
+    rounds = iter(range(5))
+
+    def sleep(_seconds):
+        if next(rounds) == 4:
+            raise Stop
+
+    class InlineThread:  # exécute la boucle tout de suite, dans le test
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def ping():
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(app.time, "sleep", sleep)
+    monkeypatch.setattr(app.threading, "Thread", InlineThread)
+    with pytest.raises(Stop):
+        app.every(10, ping)
+    assert capsys.readouterr().out.count("Operation not permitted") == 1

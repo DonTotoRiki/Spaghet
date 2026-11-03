@@ -272,3 +272,42 @@ def test_graph_refits_when_the_window_is_resized(app):
     app.processEvents()
     assert graph.zoom == zoom
     window.close()
+
+
+def test_private_addresses_are_counted_apart(app):
+    net = sample_network()
+    net.upsert_node("10.8.0.1", kind="private", name="10.8.0.1 (réseau privé)")
+    net.upsert_node("10.8.0.2", kind="private", name="10.8.0.2 (réseau privé)")
+    window = MainWindow(net)
+    window.refresh()
+    assert window.status_label.text().startswith("3 appareils · 2 destinations Internet · 2 adresses privées")
+    _ids, edges = window.graph._visible()
+    assert not any(e[3] == "star" and "10.8.0.1" in e[:2] for e in edges)  # pas de trait vers la passerelle
+
+
+def test_export_has_the_legend(app, tmp_path):
+    from PySide6.QtGui import QColor, QImage
+
+    from spaghet.graph_view import KINDS
+
+    window = MainWindow(sample_network())
+    window.refresh()
+    path = tmp_path / "graphe.png"
+    assert window.graph.export_png(str(path))
+    image = QImage(str(path))
+    colors = {image.pixelColor(x, y).name() for x in range(0, image.width() // 3) for y in range(image.height())}
+    assert QColor(KINDS["private"][0]).name() in colors  # pastille « Réseau privé » : seule la légende l'affiche
+
+
+def test_hidden_protocol_chip_is_struck_out(app):
+    from PySide6.QtWidgets import QCheckBox
+
+    window = MainWindow(sample_network())
+    chips = {box.text(): box for box in window.findChildren(QCheckBox)}
+    assert not chips["Web"].font().strikeOut()
+    chips["Web"].setChecked(False)
+    assert chips["Web"].font().strikeOut() and "web" in window.graph.hidden_protocols
+    chips["Internet"].setChecked(False)
+    assert chips["Internet"].font().strikeOut()
+    chips["Web"].setChecked(True)
+    assert not chips["Web"].font().strikeOut()

@@ -2,7 +2,7 @@
 
 Basé sur `recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
 
-**État** : les 10 étapes sont codées, 63 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, les lieux GeoIP, et la fenêtre sur un vrai écran. L'onglet Carte (tuiles OpenStreetMap) a été retiré : il n'apportait rien.
+**État** : les 10 étapes sont codées, 70 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, les lieux GeoIP, et la fenêtre sur un vrai écran. L'onglet Carte (tuiles OpenStreetMap) a été retiré : il n'apportait rien.
 
 ## Lancement
 
@@ -163,17 +163,16 @@ Marqués `shortcut:` dans le code :
 - **DNS sécurisé (DoH)** : les réponses DNS deviennent invisibles ; QUIC (vidéo YouTube) chiffre aussi le SNI → destinations « (non résolu) ».
 - **ClientHello en deux segments** (Chrome) : SNI perdu, pas de réassemblage TCP.
 - **Performance de la capture** : scapy plafonne vers quelques milliers de paquets/s ; au-delà, le débit est sous-estimé. Piste : capture en Rust ou `pyshark`.
-- **Taille du graphe** : la disposition calcule toutes les paires de nœuds (n²) ; au-delà de quelques centaines de nœuds elle ralentit. Le regroupement par domaine et le retrait à 5 min limitent la casse.
+- **Taille du graphe** : la disposition calcule toutes les paires de nœuds (n²) ; au-delà de quelques centaines de nœuds elle ralentit. Le regroupement par domaine et le retrait à 5 min limitent la casse. Le dessin, lui, tient dans le temps d'une image jusqu'à environ 300 destinations (25 ms mesurés) : liens groupés par stylo et en couleurs opaques, car un trait épais lissé et semi-transparent coûte ~8 fois plus cher.
 - **Animation** : 30 images/s, toutes les particules redessinées ; peut ramer au-delà d'environ 100 liens actifs.
 - **Disposition** : relancée quand un nœud ou un lien arrive ou part, ou quand une latence change assez pour que la longueur idéale bouge de plus de 15 unités (`RELAYOUT_LENGTH`) ; les petites variations ne la relancent pas.
 - **Proxy ARP** : sur un tel réseau, un appareil silencieux qui n'a pas sa propre réponse ARP reste invisible.
 - **Premier lancement** : la première identification a été lente (plus de 45 s) lors d'un essai, 9 s ensuite ; cause non confirmée (caches DNS et mDNS froids ?).
-- **Table IP → nom** : grandit sans limite pendant la session.
 
 ## Sécurité
 
 - Pas de serveur : rien n'écoute sur le réseau.
 - Le traceroute ne vise qu'un nœud déjà présent dans le graphe, un seul à la fois (verrou dans `probes.py`).
 - Les noms venant du réseau (mDNS, DNS, SNI) sont affichés en texte brut (`Qt.PlainText`).
-- Scan ARP refusé au-delà de 1024 adresses.
+- Scan ARP limité au /24 de la machine quand le sous-réseau dépasse 1024 adresses.
 - `setcap.sh` refuse un Python partagé, ne donne les droits qu'à `python-net` (jamais au Python de `pip`), et le restreint à ton compte (`chmod 700`).

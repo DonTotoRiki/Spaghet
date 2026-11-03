@@ -228,7 +228,7 @@ def test_private_addresses_outside_the_subnet_are_not_internet():
     for other in ("10.8.0.1", "100.64.3.4", "192.168.50.2", "169.254.10.10"):  # VPN, CGNAT, autre box, lien local
         handle(Ether() / IP(src=PC, dst=other) / TCP(sport=50000, dport=22))
         assert link_key(PC, other) in net.links
-        assert net.nodes[other].kind != "internet"
+        assert net.nodes[other].kind == "private"
         assert "réseau privé" in net.nodes[other].name
     assert UNRESOLVED not in net.nodes  # rien n'a été mélangé au vrai Internet
     handle(Ether() / IP(src=PC, dst=UNKNOWN) / TCP(sport=50001, dport=443))

@@ -143,3 +143,17 @@ def test_scan_keeps_the_real_mac_answered_after_the_proxy(monkeypatch):
     assert discovery.scan(net) == {proxy}
     assert net.nodes["192.168.128.10"].mac == "3c:22:fb:00:00:01"
     assert net.nodes["192.168.128.1"].mac == "04:e3:1a:c2:3d:42"
+
+
+def test_identify_skips_private_addresses_of_other_networks(monkeypatch):
+    from spaghet import discovery
+    from spaghet.model import Network
+
+    asked = []
+    monkeypatch.setattr(discovery, "_reverse_dns", lambda ip: asked.append(ip) or None)
+    monkeypatch.setattr(discovery, "_mdns", lambda timeout: {})
+    monkeypatch.setattr(discovery, "_netbios", lambda ips, timeout: {})
+    net = Network()
+    net.upsert_node("10.8.0.1", kind="private", name="10.8.0.1 (réseau privé)")
+    discovery.identify(net, {"10.8.0.1"})
+    assert asked == []

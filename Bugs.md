@@ -83,7 +83,7 @@ Les 34 points des deux rapports précédents sont corrigés ; ils ne sont pas re
 - **Fait :** état et tâches de fond dans une classe `Backend`, options dans `main()`, 4 tests dans `tests/test_main.py` (corrections 1, 2 et 7, plus le changement de réseau).
 - **Pas fait :** la commande `spaghet` de `[project.scripts]`. Elle lancerait le Python habituel du venv, sans droits réseau, au lieu de `python-net` : ce serait une deuxième façon de lancer Spaghet, qui ne marche pas. `./spaghet.sh` reste le lanceur.
 
-### 13. Deux lignes périmées dans `docs/architecture.md`
+### 13. ✅ Corrigé — Deux lignes périmées dans `docs/architecture.md`
 - « Table IP → nom : grandit sans limite » : faux depuis `MAX_NAMES` (`spaghet/capture.py:16`).
 - « Scan ARP refusé au-delà de 1024 adresses » : le scan se limite maintenant au /24 de la machine (`spaghet/discovery.py:68`).
 
