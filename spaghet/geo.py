@@ -7,11 +7,17 @@ DEFAULT_PATH = "geoip.mmdb"
 
 
 def load(path: str | None = None):
-    """Ouvre la base GeoIP, ou renvoie None si elle est absente : la géolocalisation est optionnelle."""
+    """Ouvre la base GeoIP, ou renvoie None si elle est absente : la géolocalisation est optionnelle.
+
+    Lève ValueError si le fichier existe mais n'est pas lisible.
+    """
     path = path or os.environ.get("SPAGHET_GEOIP") or DEFAULT_PATH
     if not os.path.exists(path):
         return None
-    return maxminddb.open_database(path)
+    try:
+        return maxminddb.open_database(path)
+    except (OSError, maxminddb.InvalidDatabaseError) as e:
+        raise ValueError(f"base {path} illisible (fichier .gz pas décompressé ?)") from e
 
 
 def _name(record: dict, key: str) -> str | None:

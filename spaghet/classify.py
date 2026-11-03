@@ -61,7 +61,7 @@ _PORTS = {
     "files": [20, 21, 139, 445, 548, 2049],
     "streaming": [554, 1935, 7000, 8009, 8554, 32400],
     "p2p": [*range(6881, 6890), 51413],
-    "infra": [67, 68, 123, 137, 138, 1900, 5353],
+    "infra": [67, 68, 123, 138, 1900],
 }
 PORT_PROTOCOLS = {port: proto for proto, ports in _PORTS.items() for port in ports}
 

@@ -44,3 +44,48 @@ def test_ping_all_skips_my_own_machine(monkeypatch):
     net.upsert_node("192.168.1.20", mac="3c:22:fb:00:00:20")
     probes.ping_all(net, "eth0", my_ip="192.168.1.10")
     assert [p.pdst for p in sent] == ["192.168.1.20"]
+
+
+def test_ping_all_ignores_proxy_arp_answers(monkeypatch):
+    """Sur un réseau à proxy ARP, le proxy répond aussi pour un appareil parti : ça ne prouve pas sa présence."""
+    from types import SimpleNamespace
+
+    from scapy.all import ARP, Ether
+
+    from spaghet import probes
+    from spaghet.model import Network
+
+    def fake_srp(packets, **k):
+        answers = []
+        for p in packets:
+            p.sent_time = 100.0
+            hwsrc = "9a:55:9a:55:9a:55" if p[ARP].pdst == "192.168.1.30" else p[Ether].dst  # .30 est parti
+            answers.append((p, SimpleNamespace(hwsrc=hwsrc, time=100.002)))
+        return answers, []
+
+    monkeypatch.setattr(probes, "srp", fake_srp)
+    net = Network()
+    net.upsert_node("192.168.1.20", mac="3c:22:fb:00:00:20", now=0.0)
+    net.upsert_node("192.168.1.30", mac="3c:22:fb:00:00:30", now=0.0)
+    probes.ping_all(net, "eth0", my_ip="192.168.1.10")
+    assert net.nodes["192.168.1.20"].rtt_ms == 2.0
+    assert net.nodes["192.168.1.30"].rtt_ms is None
+    assert net.nodes["192.168.1.30"].last_seen == 0.0  # toujours considéré muet : il sera grisé puis retiré
+
+
+def test_traceroute_intercepted_at_first_hop(monkeypatch):
+    import pytest
+
+    from spaghet import probes
+    from spaghet.model import Network
+
+    class Intercepted:
+        def get_trace(self):
+            return {"185.15.58.224": {1: ("185.15.58.224", True)}}  # « atteint » dès le premier saut
+
+    monkeypatch.setattr(probes, "scapy_traceroute", lambda *a, **k: (Intercepted(), None))
+    net = Network()
+    net.upsert_node("wikipedia.org", kind="internet", addr="185.15.58.224")
+    with pytest.raises(ValueError, match="interceptée"):
+        probes.traceroute(net, "wikipedia.org")
+    assert net.nodes["wikipedia.org"].hops is None

@@ -139,3 +139,84 @@ def test_bad_packets_never_stop_the_capture():
     handle(Ether(bytes(garbage)))  # ne doit pas lever d'exception
     handle(Ether() / IP(src=PC, dst=TV) / TCP(sport=50002, dport=8009))
     assert link_key(PC, TV) in net.links  # la suite est toujours comptée
+
+
+def test_router_real_mac_is_learned_from_internet_traffic():
+    """Proxy ARP : le routeur est connu par la MAC du proxy, mais son IPv6 de lien local utilise sa vraie MAC."""
+    router_real_mac = "04:e3:1a:c2:3d:42"
+    net = ipv6_network()  # passerelle enregistrée avec GW_MAC (celle vue en ARP)
+    handle = make_handler(net, SUBNET, prefixes6=[PREFIX6], gateway=GW)
+    handle(Ether(src=PC_MAC, dst=router_real_mac) / IPv6(src=PC6, dst=YT6) / TCP(sport=50000, dport=443))
+    handle(Ether(src=router_real_mac, dst=PC_MAC) / IPv6(src=GW6, dst=PC6) / UDP(sport=53, dport=40000))
+    assert link_key(PC, GW) in net.links  # le DNS IPv6 du routeur n'est plus perdu
+
+
+def test_dead_capture_is_restarted(tmp_path):
+    import time
+
+    from scapy.all import AsyncSniffer
+
+    from spaghet.capture import ensure_running
+
+    pcap = tmp_path / "vide.pcap"
+    wrpcap(str(pcap), [Ether() / IP(src=PC, dst=GW)])
+    seen = []
+    sniffer = AsyncSniffer(offline=str(pcap), prn=seen.append, store=False)  # se termine tout de suite, comme une coupure
+    sniffer.start()
+    sniffer.join()
+    restarted, error = ensure_running(sniffer)
+    assert restarted is not sniffer and error is not None
+    restarted.join()
+    assert len(seen) == 2  # même gestionnaire, relancé
+    assert ensure_running(restarted)[0] is not restarted  # toujours relancée tant qu'elle s'arrête
+
+    alive = AsyncSniffer(offline=str(pcap), prn=lambda p: time.sleep(1), store=False)
+    alive.start()
+    assert ensure_running(alive) == (alive, None)  # en marche : rien ne change
+    alive.join()
+
+
+def test_own_name_lookups_are_not_traffic():
+    """L'identification interroge chaque appareil (NetBIOS, et LLMNR via systemd-resolved pour le DNS inverse) :
+    vu sur le réseau réel, ça reliait la machine à tous les appareils du LAN."""
+    net = Network()
+    handle = make_handler(net, SUBNET)
+    handle(Ether() / IP(src=PC, dst=TV) / UDP(sport=51234, dport=137))
+    handle(Ether() / IP(src=TV, dst=PC) / UDP(sport=137, dport=51234))
+    handle(Ether() / IP(src=PC, dst=TV) / TCP(sport=37638, dport=5355))
+    handle(Ether() / IP(src=TV, dst=PC) / UDP(sport=5353, dport=5353))
+    assert net.links == {}
+
+
+def test_traceroute_answers_are_not_traffic():
+    """Les « délai dépassé » renvoyés par chaque routeur traversé remplissaient le nœud « (non résolu) »."""
+    from scapy.all import ICMPv6TimeExceeded
+
+    net = Network()
+    handle = make_handler(net, SUBNET)
+    handle(Ether() / IP(src="80.10.20.30", dst=PC) / ICMP(type=11) / IP(src=PC, dst=YT_VIDEO) / TCP(dport=443))
+    handle(Ether() / IP(src="80.10.20.31", dst=PC) / ICMP(type=3, code=3))
+    handle(Ether() / IPv6(src="2001:db8::1", dst=PC6) / ICMPv6TimeExceeded())
+    assert net.links == {}
+    handle(Ether() / IP(src=PC, dst=GW) / ICMP())  # un vrai ping, lui, compte
+    assert link_key(PC, GW) in net.links
+
+
+def test_name_table_is_bounded(monkeypatch):
+    from spaghet import capture
+
+    monkeypatch.setattr(capture, "MAX_NAMES", 3)
+    net = Network()
+    handle = make_handler(net, SUBNET)
+    for i in range(10):
+        handle(dns_answer(f"site{i}.com", f"93.184.0.{i}"))
+    handle(Ether() / IP(src=PC, dst="93.184.0.9") / TCP(sport=50000, dport=443))
+    assert "site9.com" in net.nodes  # toujours nommé : seul l'ancien contenu a été oublié
+
+
+def test_unreadable_dns_still_counts_as_traffic():
+    net = Network()
+    handle = make_handler(net, SUBNET)
+    garbage = Ether() / IP(src=GW, dst=PC) / UDP(sport=53, dport=40000) / Raw(b"\x12\x34\x81\x80\x00\x01\x00\x01" + b"\xff" * 8)
+    handle(Ether(bytes(garbage)))
+    assert net.links[link_key(PC, GW)].protocols == {"dns": len(garbage)}

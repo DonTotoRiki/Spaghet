@@ -31,8 +31,11 @@ PROTOCOLS = {
 }
 CLOUD = "@internet"   # pseudo-nœud « Internet » quand le groupe est replié
 CLOUD_OFFSET = 450     # distance entre la passerelle et le groupe Internet, dans le graphe
+CLOUD_PAD = (100, 40)  # marge du cadre Internet autour des destinations (largeur, hauteur), dans le graphe
+CLOUD_GAP = 40         # distance minimale entre un appareil du LAN et le cadre Internet
 STALE_AFTER = 60      # s sans réponse avant de griser un appareil (retiré à 5 min par le moteur)
 ACTIVE_BPS = 1000     # en dessous, pas de particules
+MAX_ANIMATED = 40     # particules seulement sur les liens les plus actifs : au-delà, le dessin dépasse 33 ms par image
 BACKGROUND = QColor("#111111")
 LABEL_POINTS = 9      # taille des étiquettes à l'écran, quel que soit le zoom
 
@@ -94,6 +97,9 @@ class GraphView(QWidget):
         self.zoom = 1.0
         self.temperature = 0.0     # déplacement max par pas de layout ; 0 = graphe figé
         self._fitted = False
+        # Cadrage automatique à chaque stabilisation, jusqu'à ce que l'utilisateur zoome ou déplace la vue :
+        # au lancement, les premiers nœuds arrivent avant le scan et le reste sortirait de l'écran.
+        self._auto_fit = True
         self._drag: tuple[str, str | None, QPointF] | None = None  # (mode "node"/"pan", id, point de départ)
         self._moved = False
         self._cloud_label = QRectF()
@@ -202,18 +208,25 @@ class GraphView(QWidget):
             # il se refermerait autour de ta machine, qui est reliée à toutes les destinations.
             router = self.router_id()
             anchor = p[index[router]] + (CLOUD_OFFSET, 0) if router in index else p[internet].mean(0)
-            disp[internet] += (anchor - p[internet]) * 0.05
-            center = p[internet].mean(0)
-            # Les appareils du LAN sont repoussés hors du groupe Internet : sinon ta machine, reliée à toutes
-            # les destinations, se place en leur milieu et semble faire partie d'Internet.
-            radius = np.sqrt(((p[internet] - center) ** 2).sum(-1)).max() + 80
-            away = p[~internet] - center
-            dist = np.sqrt((away ** 2).sum(-1)) + 0.01
-            push = np.clip(radius - dist, 0, None) * 0.5
-            disp[~internet] += away / dist[:, None] * push[:, None]
+            disp[internet] += (anchor - p[internet]) * 0.15
         disp -= p * 0.005  # légère gravité vers le centre
         length = np.sqrt((disp ** 2).sum(-1)) + 1e-9
         p += disp * (np.minimum(length, self.temperature) / length)[:, None]
+        if internet.any() and (~internet).any():
+            # Contrainte stricte : aucun appareil du LAN dans le cadre Internet (le rectangle dessiné, marge comprise).
+            # Sinon ta machine, reliée à toutes les destinations, se place en leur milieu. Une simple force ne suffit
+            # pas : la disposition se fige avant de l'avoir sortie.
+            pad = np.array(CLOUD_PAD) + CLOUD_GAP
+            low, high = p[internet].min(0) - pad, p[internet].max(0) + pad
+            lan = p[~internet]
+            inside = np.all((lan > low) & (lan < high), axis=1)
+            if inside.any():
+                depth = np.concatenate([lan - low, high - lan], axis=1)  # vers la gauche, le haut, la droite, le bas
+                side = depth.argmin(1)                                    # sortie par le bord le plus proche
+                rows = np.flatnonzero(inside)
+                axis = side[rows] % 2
+                lan[rows, axis] = np.where(side[rows] < 2, low[axis] - 1, high[axis] + 1)
+                p[~internet] = lan
         dragged = self._drag[1] if self._drag and self._drag[0] == "node" else None
         for i, k in index.items():
             if i != dragged:
@@ -227,6 +240,8 @@ class GraphView(QWidget):
         moving = bool(self.temperature)
         if moving:
             self._layout_step()
+            if not self.temperature and self._auto_fit:  # vient de se stabiliser
+                self.fit()
         if (moving or self._animating) and self.isVisible():
             self.update()
 
@@ -239,15 +254,19 @@ class GraphView(QWidget):
         if not ids:
             return QRectF(-100, -100, 200, 200)
         xs, ys = zip(*(self.pos[i] for i in ids))
-        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-80, -50, 80, 70)
+        # Marge : au moins celle du cadre Internet (CLOUD_PAD), sinon le cadrage le coupe au bord de l'écran.
+        mx = CLOUD_PAD[0] + 20
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-mx, -50, mx, 70)
 
-    def cloud_box(self, internet: list[str], line_height: float = 2 * LABEL_POINTS) -> QRectF:
+    def cloud_box(self, internet: list[str]) -> QRectF:
         """Cadre « Internet » dessiné autour des destinations, avec la place de leurs étiquettes."""
         xs, ys = zip(*(self.pos[i] for i in internet))
-        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(
-            -6 * line_height, -2 * line_height, 6 * line_height, 2 * line_height)
+        px, py = CLOUD_PAD
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-px, -py, px, py)
 
     def fit(self) -> None:
+        """Cadre tout le graphe, et reprend le cadrage automatique (bouton « Recadrer »)."""
+        self._auto_fit = True
         ids, _ = self._visible()
         r = self._bounds(ids)
         self.zoom = max(0.2, min(2.0, min(self.width() / r.width(), self.height() / r.height()) * 0.95))
@@ -269,7 +288,7 @@ class GraphView(QWidget):
         self._cloud_label = QRectF()
         animating = False
         if internet:
-            box = self.cloud_box(internet, line_height)
+            box = self.cloud_box(internet)
             p.setPen(QPen(QColor("#555555"), 1))
             p.setBrush(QColor(255, 255, 255, 12))
             p.drawRoundedRect(box, 12, 12)
@@ -277,7 +296,9 @@ class GraphView(QWidget):
             p.setPen(QColor("#bbbbbb"))
             p.drawText(self._cloud_label, Qt.AlignLeft | Qt.AlignVCenter, f"Internet ({len(internet)}) — clic pour replier")
 
-        for a, b, link, kind in edges:
+        busy = [k for k, e in enumerate(edges) if e[3] != "star" and e[2].get("bps", 0) > ACTIVE_BPS]
+        animated = set(sorted(busy, key=lambda k: edges[k][2]["bps"], reverse=True)[:MAX_ANIMATED])
+        for k, (a, b, link, kind) in enumerate(edges):
             pa, pb = QPointF(*self.pos[a]), QPointF(*self.pos[b])
             if kind == "star":
                 p.setPen(QPen(QColor("#555555"), 1, Qt.DashLine))
@@ -288,10 +309,11 @@ class GraphView(QWidget):
                 continue
             color = QColor(PROTOCOLS[proto][1])
             bps = link.get("bps", 0)
-            active = bps > ACTIVE_BPS
+            active = k in animated
             line = QColor(color)
             line.setAlphaF(0.35 if active else 0.8)
-            p.setPen(QPen(line, edge_width(bps), Qt.DotLine if kind == "agg" else Qt.SolidLine, Qt.RoundCap))
+            # Bouts plats : les bouts ronds doublent le temps de tracé des traits épais lissés.
+            p.setPen(QPen(line, edge_width(bps), Qt.DotLine if kind == "agg" else Qt.SolidLine, Qt.FlatCap))
             p.drawLine(pa, pb)
             if active:
                 animating = True
@@ -390,6 +412,7 @@ class GraphView(QWidget):
             self.pos[node] = [g.x(), g.y()]
         else:
             self.offset += delta
+            self._auto_fit = False  # l'utilisateur a choisi sa vue
         self._drag = (mode, node, event.position())
         self.update()
 
@@ -414,5 +437,6 @@ class GraphView(QWidget):
         new_zoom = max(0.1, min(5.0, self.zoom * factor))
         g = self._to_graph(event.position())  # le point sous la souris reste fixe
         self.offset += g * (self.zoom - new_zoom)
+        self._auto_fit = False
         self.zoom = new_zoom
         self.update()

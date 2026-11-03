@@ -119,20 +119,26 @@ def test_idle_graph_is_not_redrawn(app):
 
 
 def test_my_machine_stays_out_of_the_internet_box(app):
+    import random
+
     from spaghet.graph_view import GraphView
 
-    net = Network()
-    net.upsert_node(GW, kind="router", rtt_ms=0.4)
-    net.upsert_node(PC, kind="pc", rtt_ms=0.4)
-    domains = [f"site{i}.com" for i in range(8)]
-    for d in domains:
-        net.upsert_node(d, kind="internet", name=d)
-        net.add_traffic(PC, d, "web", 1000)  # ta machine est reliée à toutes les destinations
-    graph = GraphView()
-    graph.update_data(net.snapshot())  # pose le graphe (300 pas)
-    box = graph.cloud_box(domains)
-    assert not box.contains(QPointF(*graph.pos[PC]))
-    assert not box.contains(QPointF(*graph.pos[GW]))
+    # Positions de départ tirées au hasard : un seul tirage avait laissé passer une correction qui ratait 39 fois sur 40.
+    for seed in range(20):
+        random.seed(seed)
+        net = Network()
+        net.upsert_node(GW, kind="router", rtt_ms=0.4)
+        net.upsert_node(PC, kind="pc", rtt_ms=0.4)
+        net.upsert_node(TV, kind="iot", rtt_ms=40.0)
+        domains = [f"site{i}.com" for i in range(1 + seed % 12)]
+        for d in domains:
+            net.upsert_node(d, kind="internet", name=d)
+            net.add_traffic(PC, d, "web", 1000)  # ta machine est reliée à toutes les destinations
+        graph = GraphView()
+        graph.update_data(net.snapshot())  # pose le graphe (300 pas)
+        box = graph.cloud_box(domains)
+        for lan in (GW, PC, TV):
+            assert not box.contains(QPointF(*graph.pos[lan])), (seed, lan)
 
 
 def test_click_radius_follows_zoom(app):
@@ -159,3 +165,80 @@ def test_map_points_follow_the_repeated_world(app):
     m.center += QPointF(256 * 2 ** m.zoom, 0)  # un tour complet vers l'est
     assert m._point_screen(48.85, 2.35) == near  # le point est toujours au même endroit à l'écran
     assert m.point_at(near)[0] == "paris"
+
+
+def test_sizes_and_plurals_read_well():
+    from spaghet.gui import fmt_bps, fmt_bytes, plural
+
+    assert fmt_bytes(1_048_575) == "1.0 Mo"   # et pas « 1024.0 Ko »
+    assert fmt_bytes(1023.97) == "1.0 Ko"     # et pas « 1024 o »
+    assert fmt_bytes(512) == "512 o"
+    assert fmt_bps(999_999) == "1.0 Mbit/s"   # et pas « 1000.0 kbit/s »
+    assert (plural(0, "saut"), plural(1, "saut"), plural(9, "saut")) == ("0 saut", "1 saut", "9 sauts")
+
+
+def test_view_refits_when_layout_settles_until_user_takes_over(app):
+    from PySide6.QtCore import QRectF
+
+    from spaghet.graph_view import GraphView
+
+    def all_on_screen(graph):
+        screen = QRectF(0, 0, graph.width(), graph.height())
+        return all(screen.contains(QPointF(graph.width() / 2 + graph.offset.x() + x * graph.zoom,
+                                           graph.height() / 2 + graph.offset.y() + y * graph.zoom))
+                   for x, y in graph.pos.values())
+
+    def settle(graph):
+        while graph.temperature:
+            graph._frame()
+
+    net = Network()
+    net.upsert_node(PC, kind="pc")
+    graph = GraphView()
+    graph.resize(800, 600)
+    graph.update_data(net.snapshot())  # au lancement : un seul nœud, cadrage très serré
+    for i in range(12):                # puis le scan trouve le reste
+        net.upsert_node(f"192.168.1.{100 + i}", rtt_ms=50.0)
+    net.upsert_node(GW, kind="router")
+    graph.update_data(net.snapshot())
+    settle(graph)
+    assert all_on_screen(graph)
+
+    graph._auto_fit = False            # l'utilisateur a zoomé : on ne touche plus à sa vue
+    zoom = graph.zoom
+    net.upsert_node("192.168.1.200")
+    graph.update_data(net.snapshot())
+    settle(graph)
+    assert graph.zoom == zoom
+
+
+def test_only_the_busiest_links_are_animated(app, monkeypatch):
+    """Au-delà de MAX_ANIMATED liens animés, le dessin dépassait le budget d'une image (57 ms pour 250 liens)."""
+    import time
+
+    from PySide6.QtGui import QImage, QPainter
+
+    from spaghet import graph_view
+
+    net = Network()
+    net.upsert_node(GW, kind="router")
+    net.upsert_node(PC, kind="pc")
+    for i in range(60):
+        net.upsert_node(f"site{i}.com", kind="internet", name=f"site{i}.com")
+        net.add_traffic(PC, f"site{i}.com", "web", 1000, now=0.0)
+    net.tick(now=0.0)
+    for i, link in enumerate(net.links.values()):
+        link.bytes_total += 10_000 * (i + 1)  # débits tous différents
+    net.tick(now=1.0)
+    graph = graph_view.GraphView()
+    graph.update_data(net.snapshot())
+    animated = []
+    real = graph_view.particle_positions
+    monkeypatch.setattr(graph_view, "particle_positions",
+                        lambda length, bps, *a: animated.append(bps) or real(length, bps, *a))
+    image = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    painter = QPainter(image)
+    graph.draw(painter, time.time())
+    painter.end()
+    assert len(animated) == graph_view.MAX_ANIMATED
+    assert min(animated) > max(l.bps for l in net.links.values() if l.bps not in animated)  # les plus actifs

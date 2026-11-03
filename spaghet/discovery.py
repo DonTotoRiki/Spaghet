@@ -47,6 +47,12 @@ def local_network(iface: str | None = None, routes=None) -> tuple[str, ipaddress
     return iface, subnet, addr, gateway
 
 
+def current_network(iface: str | None = None) -> tuple[str, ipaddress.IPv4Network, str, str | None]:
+    """Comme local_network, mais relit la table de routage du système (scapy la garde en mémoire depuis son import)."""
+    conf.route.resync()
+    return local_network(iface)
+
+
 def proxy_arp_macs(replies: list[tuple[str, str]], num_addresses: int) -> set[str]:
     """MAC qui répondent pour la majorité des adresses (ip, mac) : leurs réponses ne prouvent pas qu'un appareil existe."""
     counts = Counter(mac for _ip, mac in replies)
@@ -58,7 +64,8 @@ def scan(network: Network, iface: str | None = None, timeout: float = 2.0) -> se
     """Scan ARP du sous-réseau local. Nécessite root ou CAP_NET_RAW. Renvoie les MAC de proxy ARP ignorées."""
     iface, subnet, my_ip, gateway = local_network(iface)
     if subnet.num_addresses > MAX_HOSTS:
-        raise RuntimeError(f"{subnet} est trop grand ({subnet.num_addresses} adresses, max {MAX_HOSTS})")
+        # Trop grand pour tout interroger (/16 : 65 536 adresses) : seulement le voisinage de la machine.
+        subnet = ipaddress.ip_interface(f"{my_ip}/24").network
 
     network.upsert_node(my_ip, mac=get_if_hwaddr(iface), name="cette machine")
     if gateway:

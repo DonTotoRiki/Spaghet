@@ -52,6 +52,7 @@ class MapView(QWidget):
                 self._net = QNetworkAccessManager(self)
             request = QNetworkRequest(QUrl(TILE_URL.format(z=z, x=x, y=y)))
             request.setRawHeader(b"User-Agent", USER_AGENT)
+            request.setTransferTimeout(10_000)  # une requête bloquée échoue : la tuile sera redemandée
             reply = self._net.get(request)
             reply.finished.connect(lambda: self._on_tile(key, reply))
             self._pending.add(key)

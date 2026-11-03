@@ -19,22 +19,25 @@ from spaghet.model import Network
 HISTORY = 60  # points (1/s) du mini-graphe de débit
 
 
-def fmt_bytes(n: float) -> str:
-    units = ["o", "Ko", "Mo", "Go", "To"]
+def _scaled(n: float, base: int, units: list[str]) -> str:
     i = 0
-    while n >= 1024 and i < len(units) - 1:
-        n /= 1024
+    # On compare la valeur arrondie telle qu'affichée : sinon 1 048 575 octets donnent « 1024.0 Ko ».
+    while i < len(units) - 1 and round(n, 1 if i else 0) >= base:
+        n /= base
         i += 1
-    return f"{n:.1f} {units[i]}" if i else f"{n:.0f} o"
+    return f"{n:.1f} {units[i]}" if i else f"{n:.0f} {units[0]}"
+
+
+def fmt_bytes(n: float) -> str:
+    return _scaled(n, 1024, ["o", "Ko", "Mo", "Go", "To"])
 
 
 def fmt_bps(n: float) -> str:
-    units = ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"]
-    i = 0
-    while n >= 1000 and i < len(units) - 1:
-        n /= 1000
-        i += 1
-    return f"{n:.1f} {units[i]}" if i else f"{n:.0f} bit/s"
+    return _scaled(n, 1000, ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"])
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'s' if n > 1 else ''}"  # en français, 0 et 1 restent au singulier
 
 
 def fmt_time(t: float) -> str:
@@ -270,7 +273,7 @@ class MainWindow(QMainWindow):
     def _update_status(self) -> None:
         lan = sum(1 for n in self.snapshot["nodes"] if n.get("kind") != "internet")
         internet = len(self.snapshot["nodes"]) - lan
-        counts = f"{lan} appareils · {internet} destinations Internet"
+        counts = f"{plural(lan, 'appareil')} · {plural(internet, 'destination')} Internet"
         text = f"{counts} — {self.status_message}" if self.status_message else counts
         self.status_label.setText(text)
         self.status_label.setToolTip(text)
@@ -344,7 +347,7 @@ class MainWindow(QMainWindow):
         def run():
             try:
                 hops = probes.traceroute(self.network, node_id)
-                result = "La cible n'a pas répondu" if hops is None else f"{hops} sauts"
+                result = "La cible n'a pas répondu" if hops is None else plural(hops, "saut")
             except (RuntimeError, ValueError, KeyError, OSError) as e:
                 result = f"Traceroute impossible : {e}"
             self.bridge.traced.emit(node_id, result)

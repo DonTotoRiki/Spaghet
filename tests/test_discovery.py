@@ -91,3 +91,18 @@ def test_identify_skips_internet_nodes(monkeypatch):
     net.upsert_node("youtube.com", kind="internet", name="youtube.com")
     discovery.identify(net, {"192.168.1.20", "youtube.com", "parti.depuis"})
     assert set(asked) == {"192.168.1.20"}  # jamais de requête vers une destination Internet ni un nœud disparu
+
+
+def test_big_subnet_scans_only_the_neighbourhood(monkeypatch):
+    from spaghet import discovery
+    from spaghet.model import Network
+
+    scanned = []
+    monkeypatch.setattr(discovery, "arping", lambda net, **k: scanned.append(net) or ([], []))
+    monkeypatch.setattr(discovery, "get_if_hwaddr", lambda iface: "3c:22:fb:ff:ff:ff")
+    monkeypatch.setattr(discovery.conf.route, "routes", [
+        (0, 0, "10.0.0.1", "eth0", "10.0.42.7", 100),
+        (167772160, 4294901760, "0.0.0.0", "eth0", "10.0.42.7", 100),  # 10.0.0.0/16
+    ])
+    discovery.scan(Network())
+    assert scanned == ["10.0.42.0/24"]

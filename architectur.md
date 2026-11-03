@@ -8,8 +8,8 @@ Basé sur `Recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
 
 ```
 cd ~/Bureau/Spaghet
-./setcap.sh                    # une fois : droits réseau pour le Python du venv
-.venv/bin/python -m spaghet    # ouvre la fenêtre
+./setcap.sh     # une fois : droits réseau pour .venv/bin/python-net, une copie de Python réservée à Spaghet
+./spaghet.sh    # ouvre la fenêtre
 ```
 
 Options : `--iface` (défaut : interface de la route par défaut), `--geoip` (défaut : `$SPAGHET_GEOIP` ou `geoip.mmdb`).
@@ -30,7 +30,8 @@ Au démarrage : la fenêtre s'ouvre tout de suite, puis un thread fait scan ARP 
 ```
 Spaghet/
 ├── pyproject.toml
-├── setcap.sh              # droits réseau sur le Python du venv (refuse un Python partagé)
+├── setcap.sh              # droits réseau sur .venv/bin/python-net (refuse un Python partagé)
+├── spaghet.sh             # lanceur : python-net -m spaghet
 ├── spaghet/
 │   ├── __main__.py        # point d'entrée, options, tâches de fond (every)
 │   ├── model.py           # Node, Link, Network : état en mémoire, diffs, débit, retrait
@@ -141,7 +142,7 @@ Le graphe (`graph_view.py`) garde ses propres positions. Un nœud nouveau est po
 | Toute réponse ARP = un appareil | Proxy ARP détecté et ignoré | Sur le réseau de test, une même MAC répondait pour les 512 adresses |
 | `geoip2` + GeoLite2 | `maxminddb` + DB-IP City Lite ou GeoLite2 | Même format, moins de code ; DB-IP ne demande pas de compte |
 | Internet replié par défaut (`Recherche.md`) | Déplié par défaut | Les noms sont visibles tout de suite |
-| `setcap` sur l'interpréteur du venv | venv recréé avec `--copies`, puis `setcap.sh` | Le venv pointait vers `/usr/bin/python3.14` : `setcap` aurait donné les droits à tout Python du système |
+| `setcap` sur l'interpréteur du venv | venv recréé avec `--copies`, droits sur une copie dédiée `python-net` | Le venv pointait vers `/usr/bin/python3.14` : `setcap` aurait donné les droits à tout Python du système. Et sur le Python habituel du venv, `pip install` aurait exécuté le code des paquets avec ces droits |
 
 ## Raccourcis connus
 
@@ -172,4 +173,4 @@ Marqués `shortcut:` dans le code :
 - Le traceroute ne vise qu'un nœud déjà présent dans le graphe, un seul à la fois (verrou dans `probes.py`).
 - Les noms venant du réseau (mDNS, DNS, SNI) sont affichés en texte brut (`Qt.PlainText`) et échappés dans les infobulles de la carte, que Qt interpréterait comme du HTML.
 - Scan ARP refusé au-delà de 1024 adresses.
-- `setcap.sh` refuse un Python partagé et restreint l'interpréteur privilégié à ton compte (`chmod 700`).
+- `setcap.sh` refuse un Python partagé, ne donne les droits qu'à `python-net` (jamais au Python de `pip`), et le restreint à ton compte (`chmod 700`).

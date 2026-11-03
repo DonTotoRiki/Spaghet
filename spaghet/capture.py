@@ -3,12 +3,17 @@ import time
 
 from scapy.all import DNS, ICMP, IP, TCP, UDP, AsyncSniffer, Ether, IPv6, Raw
 from scapy.arch import in6_getifaddr
+from scapy.layers.inet6 import ICMPv6DestUnreach, ICMPv6TimeExceeded
 
 from spaghet import geo
 from spaghet.classify import STREAMING_DOMAINS, protocol, registrable_domain
 from spaghet.model import Network
 
 UNRESOLVED = "(non résolu)"  # nœud qui regroupe les IP Internet dont on n'a pas vu le nom
+# Résolution de noms locale : NetBIOS, mDNS, LLMNR. L'identification des appareils (et systemd-resolved pour le DNS
+# inverse) les interroge un par un : compter ces échanges relierait la machine à tout le LAN sans vrai contact.
+NAME_SERVICE_PORTS = {137, 5353, 5355}
+MAX_NAMES = 50_000  # IP → nom retenues ; au-delà on repart de zéro (les noms reviennent avec les prochaines réponses DNS)
 
 
 def tls_sni(payload: bytes) -> str | None:
@@ -42,7 +47,7 @@ def local_prefixes6(iface: str) -> list[ipaddress.IPv6Network]:
 
 
 def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=None,
-                 prefixes6: list[ipaddress.IPv6Network] = ()):
+                 prefixes6: list[ipaddress.IPv6Network] = (), gateway: str | None = None):
     """Callback scapy : chaque paquet IPv4 ou IPv6 devient du trafic sur un lien du graphe.
 
     Les IP Internet deviennent un nœud par domaine, nommé grâce aux réponses DNS et au SNI TLS vus passer.
@@ -51,9 +56,12 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
     names: dict[str, str] = {}  # IP Internet → nom d'hôte
     by_mac: dict[str, str] = {}  # MAC → IP du nœud LAN, reconstruit au plus une fois par seconde
     by_mac_built = 0.0
+    router_macs: set[str] = set()  # MAC vers lesquelles part le trafic Internet : celles de la passerelle
     errors: set[str] = set()     # types d'erreur déjà signalés, pour ne pas inonder le terminal
 
     def learn(pkt, l3) -> None:
+        if len(names) > MAX_NAMES:
+            names.clear()
         if UDP in pkt and pkt[UDP].sport == 53 and DNS in pkt and pkt[DNS].qr == 1 and pkt[DNS].qd:
             # Le nom demandé, pas la fin de la chaîne CNAME : « youtube.com » plutôt que « youtube-ui.l.google.com ».
             asked = pkt[DNS].qd[0].qname.decode(errors="replace")
@@ -69,6 +77,8 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
         nonlocal by_mac_built
         if mac is None:
             return None
+        if mac in router_macs:
+            return gateway
         if mac not in by_mac and time.monotonic() - by_mac_built > 1:
             by_mac.clear()
             by_mac.update({n.mac: n.ip for n in list(network.nodes.values()) if n.mac})
@@ -85,6 +95,10 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
             # Les appareils du LAN ont plusieurs adresses IPv6 (lien local, temporaires) : on les retrouve par la MAC.
             # Inconnue (appareil jamais vu en IPv4) : paquet ignoré plutôt qu'un nœud de plus par adresse.
             return lan_node(mac)
+        if gateway and mac:
+            # Le paquet vient d'Internet ou y va : la MAC de ce côté est celle du routeur. Sa vraie MAC peut différer
+            # de celle vue en ARP (proxy ARP) ; sans ça, ses échanges IPv6 de lien local seraient ignorés.
+            router_macs.add(mac)
         node_id = registrable_domain(names[ip]) if ip in names else UNRESOLVED
         if node_id not in network.nodes:
             # Créé avec son type avant le trafic, pour que l'interface ne le voie jamais sans.
@@ -106,7 +120,16 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
         l3 = pkt[IP] if IP in pkt else pkt[IPv6] if IPv6 in pkt else None
         if l3 is None:
             return
-        learn(pkt, l3)
+        l4 = pkt[TCP] if TCP in pkt else pkt[UDP] if UDP in pkt else None
+        if l4 is not None and NAME_SERVICE_PORTS & {l4.sport, l4.dport}:
+            return
+        if (ICMP in pkt and pkt[ICMP].type in (3, 11)) or ICMPv6TimeExceeded in pkt or ICMPv6DestUnreach in pkt:
+            # Messages d'erreur des routeurs traversés, surtout les réponses de notre traceroute : pas un échange.
+            return
+        try:
+            learn(pkt, l3)
+        except (AttributeError, IndexError, UnicodeDecodeError):
+            pass  # réponse DNS ou ClientHello illisible : on perd le nom, pas le trafic
         ether = pkt[Ether] if Ether in pkt else None
         src = endpoint(l3.src, ether.src if ether else None)
         dst = endpoint(l3.dst, ether.dst if ether else None)
@@ -123,9 +146,23 @@ def make_handler(network: Network, subnet: ipaddress.IPv4Network, geo_reader=Non
     return handle
 
 
-def start(network: Network, iface: str, subnet: ipaddress.IPv4Network, geo_reader=None) -> AsyncSniffer:
+def start(network: Network, iface: str, subnet: ipaddress.IPv4Network, geo_reader=None,
+          gateway: str | None = None) -> AsyncSniffer:
     """Capture IPv4 et IPv6 en tâche de fond. Nécessite root ou CAP_NET_RAW."""
-    handler = make_handler(network, subnet, geo_reader, local_prefixes6(iface))
+    handler = make_handler(network, subnet, geo_reader, local_prefixes6(iface), gateway)
     sniffer = AsyncSniffer(iface=iface, filter="ip or ip6", store=False, prn=handler)
     sniffer.start()
     return sniffer
+
+
+def ensure_running(sniffer: AsyncSniffer) -> tuple[AsyncSniffer, Exception | None]:
+    """Relance la capture si elle s'est arrêtée : scapy la termine quand l'interface est coupée (veille, Wi-Fi).
+
+    Renvoie la capture en marche et l'erreur qui avait arrêté la précédente (None si rien n'a été relancé).
+    """
+    if sniffer.thread is not None and sniffer.thread.is_alive():
+        return sniffer, None
+    error = sniffer.exception or RuntimeError("capture arrêtée")
+    restarted = AsyncSniffer(*sniffer.args, **sniffer.kwargs)  # même interface, même filtre, même gestionnaire
+    restarted.start()
+    return restarted, error
