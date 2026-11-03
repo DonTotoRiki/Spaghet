@@ -1,8 +1,8 @@
 # Spaghet — Architecture technique
 
-Basé sur `Recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
+Basé sur `recherche.md`. Stack : Python ≥ 3.12, scapy, PySide6 (Qt 6), numpy.
 
-**État** : les 10 étapes sont codées, 29 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `Recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, la carte avec des lieux, et la fenêtre sur un vrai écran.
+**État** : les 10 étapes sont codées, 54 tests (`pytest`). L'interface web d'origine a été remplacée par une **fenêtre Qt native** (voir `recherche.md`, « Stack retenue »). Spaghet a tourné sur le réseau réel, avec une capture de la fenêtre faite sans écran : scan avec proxy ARP filtré, noms, latence, trafic vers Internet. Pas encore vérifiés en réel : le traceroute, la carte avec des lieux, et la fenêtre sur un vrai écran.
 
 ## Lancement
 
@@ -29,7 +29,11 @@ Au démarrage : la fenêtre s'ouvre tout de suite, puis un thread fait scan ARP 
 
 ```
 Spaghet/
+├── README.md
 ├── pyproject.toml
+├── docs/
+│   ├── architecture.md    # ce fichier
+│   └── recherche.md       # étude préalable, choix de la stack
 ├── setcap.sh              # droits réseau sur .venv/bin/python-net (refuse un Python partagé)
 ├── spaghet.sh             # lanceur : python-net -m spaghet
 ├── spaghet/
@@ -141,7 +145,7 @@ Le graphe (`graph_view.py`) garde ses propres positions. Un nœud nouveau est po
 | `hops` dans une info-bulle | Dans le panneau de détails | Le panneau existait déjà |
 | Toute réponse ARP = un appareil | Proxy ARP détecté et ignoré | Sur le réseau de test, une même MAC répondait pour les 512 adresses |
 | `geoip2` + GeoLite2 | `maxminddb` + DB-IP City Lite ou GeoLite2 | Même format, moins de code ; DB-IP ne demande pas de compte |
-| Internet replié par défaut (`Recherche.md`) | Déplié par défaut | Les noms sont visibles tout de suite |
+| Internet replié par défaut (`recherche.md`) | Déplié par défaut | Les noms sont visibles tout de suite |
 | `setcap` sur l'interpréteur du venv | venv recréé avec `--copies`, droits sur une copie dédiée `python-net` | Le venv pointait vers `/usr/bin/python3.14` : `setcap` aurait donné les droits à tout Python du système. Et sur le Python habituel du venv, `pip install` aurait exécuté le code des paquets avec ces droits |
 
 ## Raccourcis connus
